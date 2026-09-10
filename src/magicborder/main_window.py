@@ -116,7 +116,19 @@ PROJECT_PANEL_DEFAULT_SIZES = [380, 220, 320]
 HISTOGRAM_DEFAULT_SIZES = [170, 170, 170, 170, 170]
 CONTOUR_ANALYSIS_SYNC_PIXEL_LIMIT = 300_000
 CONTOUR_ANALYSIS_PENDING_TEXT = "расчёт..."
+CONTOUR_ANALYSIS_OUTDATED_TEXT = "нажмите «Обновить»"
+HISTOGRAM_MANUAL_REFRESH_TEXT = (
+    "Нажмите «Обновить», чтобы построить гистограммы по текущему контуру."
+)
+ANALYSIS_OUTDATED_STATUS_TEXT = "Данные устарели"
 ContourAnalysisCacheKey = tuple[str | None, str | None, ContourSignature]
+ProjectMeanColorStats = tuple[
+    tuple[int, int, int],
+    tuple[int, int, int],
+    tuple[int, int, int],
+    tuple[int, int, int],
+    tuple[int, int, int],
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,9 +432,7 @@ class MainWindow(QMainWindow):
             self,
             default_file_name_provider=lambda: self._default_histogram_file_name("lms"),
         )
-        self._histogram_refresh_timer = QTimer(self)
-        self._histogram_refresh_timer.setSingleShot(True)
-        self._histogram_refresh_timer.timeout.connect(self._refresh_histograms)
+        self._analysis_refresh_allowed = False
         self._project_summary_refresh_timer = QTimer(self)
         self._project_summary_refresh_timer.setSingleShot(True)
         self._project_summary_refresh_timer.timeout.connect(
@@ -431,6 +441,7 @@ class MainWindow(QMainWindow):
         self._contour_analysis_thread_pool = QThreadPool.globalInstance()
         self._contour_analysis_request_id = 0
         self._contour_analysis_cache: ContourAnalysisWorkResult | None = None
+        self._project_mean_color_stats_cache: ProjectMeanColorStats | None = None
         self._pending_contour_analysis_key: ContourAnalysisCacheKey | None = None
         self._pending_contour_analysis_request_id: int | None = None
         self._contour_analysis_workers: set[_ContourAnalysisWorker] = set()
@@ -467,10 +478,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Откройте фотографию листа растения.")
         self.canvas.message_changed.connect(self.statusBar().showMessage)
         self.canvas.image_state_changed.connect(self._update_action_states)
-        self.canvas.image_state_changed.connect(self._schedule_histogram_refresh)
         self.canvas.image_state_changed.connect(self._update_project_properties)
         self.canvas.contour_state_changed.connect(self._update_action_states)
-        self.canvas.contour_geometry_changed.connect(self._schedule_histogram_refresh)
         self.canvas.contour_geometry_changed.connect(
             self._handle_contour_geometry_changed
         )
@@ -1769,6 +1778,28 @@ class MainWindow(QMainWindow):
         analysis_title = QLabel("Свойства и аналитика")
         analysis_title.setObjectName("analysisTitle")
 
+        self.analysis_status_label = QLabel("")
+        self.analysis_status_label.setObjectName("analysisStatus")
+        self.analysis_status_label.setWordWrap(True)
+
+        self.refresh_analysis_button = QToolButton(analysis_panel)
+        self.refresh_analysis_button.setObjectName("refreshAnalysisButton")
+        self.refresh_analysis_button.setText("Обновить")
+        self.refresh_analysis_button.setIcon(load_icon("refresh-analysis"))
+        self.refresh_analysis_button.setToolTip("Обновить графики (F9)")
+        self.refresh_analysis_button.setStatusTip(
+            "Пересчитать гистограммы и аналитику по загруженным изображениям."
+        )
+        self.refresh_analysis_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.refresh_analysis_button.clicked.connect(self.refresh_analysis)
+
+        analysis_header_layout = QHBoxLayout()
+        analysis_header_layout.setContentsMargins(0, 0, 0, 0)
+        analysis_header_layout.setSpacing(6)
+        analysis_header_layout.addWidget(analysis_title)
+        analysis_header_layout.addWidget(self.analysis_status_label, 1)
+        analysis_header_layout.addWidget(self.refresh_analysis_button)
+
         self.histogram_splitter = QSplitter(Qt.Vertical, analysis_panel)
         self.histogram_splitter.setChildrenCollapsible(False)
         self.histogram_splitter.addWidget(self.rgb_histogram_panel)
@@ -1785,12 +1816,14 @@ class MainWindow(QMainWindow):
         analysis_layout = QVBoxLayout(analysis_panel)
         analysis_layout.setContentsMargins(10, 10, 10, 10)
         analysis_layout.setSpacing(8)
-        analysis_layout.addWidget(analysis_title)
+        analysis_layout.addLayout(analysis_header_layout)
         analysis_layout.addWidget(self.histogram_splitter, 1)
 
         analysis_panel.setStyleSheet(
             "QWidget#analysisPanel { background: #f7f9fc; border-left: 1px solid #d6dde8; }"
             "QLabel#analysisTitle { color: #1f2937; font-size: 13px; font-weight: 600; }"
+            "QLabel#analysisStatus { color: #b45309; font-size: 11px; }"
+            "QToolButton#refreshAnalysisButton { padding: 5px 10px; font-weight: 600; }"
             "QFrame#histogramPanel { background: #ffffff; border: 1px solid #ccd6e1; border-radius: 6px; }"
             "QLabel#histogramTitle { color: #1f2937; font-size: 12px; font-weight: 600; }"
             "QToolButton { border: 1px solid transparent; border-radius: 4px; padding: 4px; }"
@@ -1913,6 +1946,10 @@ class MainWindow(QMainWindow):
         self.open_annotation_action.setShortcut("Ctrl+Shift+O")
         self.open_annotation_action.triggered.connect(self.open_annotation_file)
 
+        self.refresh_analysis_action = QAction("Обновить", self)
+        self.refresh_analysis_action.setShortcut("F9")
+        self.refresh_analysis_action.triggered.connect(self.refresh_analysis)
+
         self.about_action = QAction("О программе", self)
         self.about_action.triggered.connect(self.show_about_dialog)
 
@@ -1947,6 +1984,7 @@ class MainWindow(QMainWindow):
             "delete_segment": self.delete_segment_action,
             "save_annotation": self.save_annotation_action,
             "open_annotation": self.open_annotation_action,
+            "refresh_analysis": self.refresh_analysis_action,
             "about": self.about_action,
         }
 
@@ -1978,6 +2016,8 @@ class MainWindow(QMainWindow):
         view_menu.addSeparator()
         view_menu.addAction(self.show_all_canvas_elements_action)
         view_menu.addAction(self.hide_all_canvas_elements_action)
+        view_menu.addSeparator()
+        view_menu.addAction(self.refresh_analysis_action)
 
         tools_menu = self.menuBar().addMenu("Инструменты")
         tools_menu.addAction(self.new_contour_action)
@@ -2029,6 +2069,8 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.show_all_canvas_elements_action)
         toolbar.addAction(self.hide_all_canvas_elements_action)
         toolbar.addSeparator()
+        toolbar.addAction(self.refresh_analysis_action)
+        toolbar.addSeparator()
         toolbar.addAction(self.new_contour_action)
         toolbar.addAction(self.detect_contour_action)
         toolbar.addAction(self.delete_contour_action)
@@ -2050,6 +2092,7 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.exit_action)
 
     def _update_action_states(self, *_args) -> None:
+        self._update_analysis_status()
         has_image = self.canvas.has_image()
         has_contour = self.canvas.has_contour()
         has_project = self.project_document is not None
@@ -2101,6 +2144,8 @@ class MainWindow(QMainWindow):
         )
         self.save_annotation_action.setEnabled(has_project_image and has_contour)
         self.open_annotation_action.setEnabled(has_project_image)
+        self.refresh_analysis_action.setEnabled(has_project)
+        self.refresh_analysis_button.setEnabled(has_project)
 
     def restore_default_view(self) -> None:
         self._restore_splitter_defaults()
@@ -2198,10 +2243,36 @@ class MainWindow(QMainWindow):
             return measurement_type, measurement_id
         return None
 
-    def _schedule_histogram_refresh(self, *_args) -> None:
-        self._histogram_refresh_timer.start(120)
+    def refresh_analysis(self) -> None:
+        self._analysis_refresh_allowed = True
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self._refresh_histograms()
+            self._update_project_summary_properties()
+            self._update_project_properties()
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._analysis_refresh_allowed = False
+
+        self._update_action_states()
+        if self._is_current_contour_analysis_pending():
+            self.statusBar().showMessage("Идёт расчёт графиков...")
+        elif self.canvas.has_image() and self.canvas.has_contour():
+            self.statusBar().showMessage("Графики и аналитика обновлены.")
+        else:
+            self.statusBar().showMessage(
+                "Нечего пересчитывать: выберите изображение с контуром."
+            )
 
     def _refresh_histograms(self) -> None:
+        previously_allowed = self._analysis_refresh_allowed
+        self._analysis_refresh_allowed = True
+        try:
+            self._apply_refreshed_histograms()
+        finally:
+            self._analysis_refresh_allowed = previously_allowed
+
+    def _apply_refreshed_histograms(self) -> None:
         result = self._ensure_current_contour_analysis(defer_large_async=False)
         if result is None:
             if self._is_current_contour_analysis_pending():
@@ -2240,6 +2311,7 @@ class MainWindow(QMainWindow):
                 )
             else:
                 panel.set_histogram(histogram)
+        self._update_analysis_status()
 
     def _clear_histograms(self, message: str) -> None:
         for panel in (
@@ -2250,6 +2322,7 @@ class MainWindow(QMainWindow):
             self.lms_histogram_panel,
         ):
             panel.clear_histogram(message)
+        self._update_analysis_status()
 
     def _ensure_current_contour_analysis(
         self,
@@ -2266,17 +2339,15 @@ class MainWindow(QMainWindow):
             return self._contour_analysis_cache
         if self._pending_contour_analysis_key == key:
             return None
+        if not self._analysis_refresh_allowed:
+            return None
 
         image_size = self.canvas.image_size()
         if image_size is None:
             return None
         width, height = image_size
         is_large_image = width * height > CONTOUR_ANALYSIS_SYNC_PIXEL_LIMIT
-        if (
-            is_large_image
-            and defer_large_async
-            and self._histogram_refresh_timer.isActive()
-        ):
+        if is_large_image and defer_large_async:
             return None
 
         try:
@@ -2361,16 +2432,26 @@ class MainWindow(QMainWindow):
         inputs = self._current_contour_analysis_inputs(record)
         if inputs is None:
             return False
-        if self._pending_contour_analysis_key == inputs[0]:
-            return True
-        image_size = self.canvas.image_size()
-        if image_size is None:
+        return self._pending_contour_analysis_key == inputs[0]
+
+    def _is_current_contour_analysis_outdated(
+        self,
+        record: ProjectImageRecord | None = None,
+    ) -> bool:
+        inputs = self._current_contour_analysis_inputs(record)
+        if inputs is None:
             return False
-        width, height = image_size
-        return (
-            width * height > CONTOUR_ANALYSIS_SYNC_PIXEL_LIMIT
-            and self._histogram_refresh_timer.isActive()
-        )
+        if self._contour_analysis_cache_matches(inputs[0]):
+            return False
+        return not self._is_current_contour_analysis_pending(record)
+
+    def _update_analysis_status(self) -> None:
+        if self._is_current_contour_analysis_pending():
+            self.analysis_status_label.setText(CONTOUR_ANALYSIS_PENDING_TEXT)
+        elif self._is_current_contour_analysis_outdated():
+            self.analysis_status_label.setText(ANALYSIS_OUTDATED_STATUS_TEXT)
+        else:
+            self.analysis_status_label.setText("")
 
     def _is_contour_analysis_result_current(
         self, result: ContourAnalysisWorkResult
@@ -3530,7 +3611,7 @@ class MainWindow(QMainWindow):
             return
 
         self._save_current_project_annotation()
-        self._refresh_histograms()
+        self._clear_histograms(HISTOGRAM_MANUAL_REFRESH_TEXT)
         self._update_project_properties()
         self._update_action_states()
         self.statusBar().showMessage(f"Создан новый контур: {len(points)} узлов.")
@@ -3554,6 +3635,7 @@ class MainWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
 
+        self._clear_histograms(HISTOGRAM_MANUAL_REFRESH_TEXT)
         self.statusBar().showMessage(f"Контур построен: {len(points)} узлов.")
 
     def delete_current_contour(self) -> None:
@@ -4307,11 +4389,13 @@ class MainWindow(QMainWindow):
             return
 
         self._current_annotation_path = annotation_path
+        self._clear_histograms(HISTOGRAM_MANUAL_REFRESH_TEXT)
         self.statusBar().showMessage(f"Аннотация открыта: {annotation_path.name}")
 
     def _set_project(self, project_path: Path, document: ProjectDocument) -> None:
         self.project_path = project_path.resolve()
         self.project_document = document
+        self._project_mean_color_stats_cache = None
         project_name_was_synced = self._sync_project_document_name_with_path()
         self._current_project_image_id = None
         self._current_annotation_path = None
@@ -4338,6 +4422,7 @@ class MainWindow(QMainWindow):
 
     def _clear_project_state(self) -> None:
         self._project_autosave_timer.stop()
+        self._project_mean_color_stats_cache = None
         self.project_document = None
         self.project_path = None
         self._current_project_image_id = None
@@ -4552,7 +4637,7 @@ class MainWindow(QMainWindow):
         if size_changed:
             self._schedule_project_save()
         if loaded_ok:
-            self._refresh_histograms()
+            self._clear_histograms(HISTOGRAM_MANUAL_REFRESH_TEXT)
         self._update_current_project_list_item(record)
         self._update_project_summary_properties()
         self._update_project_properties()
@@ -4562,6 +4647,7 @@ class MainWindow(QMainWindow):
     def _handle_contour_geometry_changed(self) -> None:
         if self._loading_project_image:
             return
+        self._update_analysis_status()
         self._save_current_project_annotation()
         if self._should_defer_project_summary_refresh():
             self._schedule_project_summary_refresh()
@@ -4837,20 +4923,11 @@ class MainWindow(QMainWindow):
         finally:
             self._updating_project_identity_fields = False
 
-    def _project_contours_mean_color_stats(
-        self,
-    ) -> (
-        tuple[
-            tuple[int, int, int],
-            tuple[int, int, int],
-            tuple[int, int, int],
-            tuple[int, int, int],
-            tuple[int, int, int],
-        ]
-        | None
-    ):
+    def _project_contours_mean_color_stats(self) -> ProjectMeanColorStats | None:
         if self.project_document is None:
             return None
+        if not self._analysis_refresh_allowed:
+            return self._project_mean_color_stats_cache
 
         rgb_total = np.zeros(3, dtype=np.float64)
         lab_total = np.zeros(3, dtype=np.float64)
@@ -4892,6 +4969,7 @@ class MainWindow(QMainWindow):
             pixel_count += int(pixels.shape[0])
 
         if pixel_count == 0:
+            self._project_mean_color_stats_cache = None
             return None
 
         mean_rgb_values = np.rint(rgb_total / pixel_count).astype(int)
@@ -4919,7 +4997,14 @@ class MainWindow(QMainWindow):
             int(mean_yuv_values[1]),
             int(mean_yuv_values[2]),
         )
-        return mean_rgb, mean_lab, mean_hsv, mean_yuv, mean_lms_values
+        self._project_mean_color_stats_cache = (
+            mean_rgb,
+            mean_lab,
+            mean_hsv,
+            mean_yuv,
+            mean_lms_values,
+        )
+        return self._project_mean_color_stats_cache
 
     def _update_project_properties(self, *_args) -> None:
         record = self._selected_project_image()
@@ -4966,12 +5051,19 @@ class MainWindow(QMainWindow):
             calibration_scale_text = _calibration_scale_text(record.calibration)
 
         contour_stats = self._current_contour_stats(record)
-        contour_analysis_pending = (
+        analysis_is_current_record = (
             contour_stats is None
             and record.id == self._current_project_image_id
             and self.canvas.has_image()
             and self.canvas.has_contour()
+        )
+        contour_analysis_pending = (
+            analysis_is_current_record
             and self._is_current_contour_analysis_pending(record)
+        )
+        contour_analysis_outdated = (
+            analysis_is_current_record
+            and self._is_current_contour_analysis_outdated(record)
         )
         if contour_stats is None:
             red_text = green_text = blue_text = "-"
@@ -4981,14 +5073,19 @@ class MainWindow(QMainWindow):
             lms_l_text = lms_m_text = lms_s_text = "-"
             contour_pixels_text = "-"
             contour_area_mm2_text = "-"
+            placeholder = ""
             if contour_analysis_pending:
-                red_text = green_text = blue_text = CONTOUR_ANALYSIS_PENDING_TEXT
-                lab_l_text = lab_a_text = lab_b_text = CONTOUR_ANALYSIS_PENDING_TEXT
-                hsv_h_text = hsv_s_text = hsv_v_text = CONTOUR_ANALYSIS_PENDING_TEXT
-                yuv_y_text = yuv_u_text = yuv_v_text = CONTOUR_ANALYSIS_PENDING_TEXT
-                lms_l_text = lms_m_text = lms_s_text = CONTOUR_ANALYSIS_PENDING_TEXT
-                contour_pixels_text = CONTOUR_ANALYSIS_PENDING_TEXT
-                contour_area_mm2_text = CONTOUR_ANALYSIS_PENDING_TEXT
+                placeholder = CONTOUR_ANALYSIS_PENDING_TEXT
+            elif contour_analysis_outdated:
+                placeholder = CONTOUR_ANALYSIS_OUTDATED_TEXT
+            if placeholder:
+                red_text = green_text = blue_text = placeholder
+                lab_l_text = lab_a_text = lab_b_text = placeholder
+                hsv_h_text = hsv_s_text = hsv_v_text = placeholder
+                yuv_y_text = yuv_u_text = yuv_v_text = placeholder
+                lms_l_text = lms_m_text = lms_s_text = placeholder
+                contour_pixels_text = placeholder
+                contour_area_mm2_text = placeholder
             mean_rgb = None
         else:
             mean_rgb, mean_lab, mean_hsv, mean_yuv, mean_lms, contour_pixel_count = (

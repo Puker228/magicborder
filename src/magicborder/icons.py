@@ -169,6 +169,11 @@ ACTION_VISUALS: dict[str, ActionVisual] = {
         tool_tip="Открыть аннотацию",
         status_tip="Загрузить контур из JSON-файла аннотации.",
     ),
+    "refresh_analysis": ActionVisual(
+        icon_name="refresh-analysis",
+        tool_tip="Обновить",
+        status_tip="Пересчитать гистограммы и аналитику по загруженным изображениям.",
+    ),
     "about": ActionVisual(
         icon_name="about",
         tool_tip="О программе",

@@ -18,6 +18,7 @@ from magicborder.contour_analysis import (  # noqa: E402
 )
 from magicborder.io_utils import load_project, save_project  # noqa: E402
 from magicborder.main_window import (  # noqa: E402
+    CONTOUR_ANALYSIS_OUTDATED_TEXT,
     CONTOUR_ANALYSIS_PENDING_TEXT,
     ContourAnalysisWorkResult,
     MainWindow,
@@ -102,13 +103,17 @@ class ContourAnalysisTests(unittest.TestCase):
             ]
             window.canvas.set_contour(first_points)
 
+            # Без команды «Обновить» расчёт не стартует.
             self.assertEqual(fake_pool.workers, [])
+            self.assertEqual(
+                window.property_contour_pixels.text(), CONTOUR_ANALYSIS_OUTDATED_TEXT
+            )
+
+            window.refresh_analysis()
+            self.assertEqual(len(fake_pool.workers), 1)
             self.assertEqual(
                 window.property_contour_pixels.text(), CONTOUR_ANALYSIS_PENDING_TEXT
             )
-
-            window._refresh_histograms()
-            self.assertEqual(len(fake_pool.workers), 1)
             first_result = ContourAnalysisWorkResult(
                 request_id=window._contour_analysis_request_id,
                 record_id="leaf-1",

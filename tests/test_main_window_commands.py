@@ -11,7 +11,10 @@ from PyQt5.QtWidgets import QApplication, QMessageBox
 from magicborder import main_window as main_window_module
 from magicborder.io_utils import load_project, save_project
 from magicborder.main_window import (
+    ANALYSIS_OUTDATED_STATUS_TEXT,
+    CONTOUR_ANALYSIS_OUTDATED_TEXT,
     HISTOGRAM_DEFAULT_SIZES,
+    HISTOGRAM_MANUAL_REFRESH_TEXT,
     WORKSPACE_DEFAULT_SIZES,
     MainWindow,
     _unique_destination_path,
@@ -1317,12 +1320,89 @@ class TestHistograms:
         window = project_window()
         window.canvas.set_contour(CONTOUR)
 
-        first = window._ensure_current_contour_analysis(defer_large_async=False)
+        window.refresh_analysis()
+
+        first = window._contour_analysis_cache
         second = window._ensure_current_contour_analysis(defer_large_async=False)
 
         assert first is not None
         assert second is first
 
+
+class TestManualAnalysisRefresh:
+    HISTOGRAM_PANELS = TestHistograms.HISTOGRAM_PANELS
+
+    def _panels(self, window: MainWindow) -> list[Any]:
+        return [getattr(window, name) for name in self.HISTOGRAM_PANELS]
+
+    def test_loading_an_image_does_not_recalculate(self, project_window) -> None:
+        window = project_window()
+
+        assert window._contour_analysis_cache is None
+        for panel in self._panels(window):
+            assert panel.canvas.has_plot_data() is False
+            assert panel.canvas._empty_message == HISTOGRAM_MANUAL_REFRESH_TEXT
+
+    def test_new_contour_only_marks_the_analysis_as_outdated(
+        self, project_window
+    ) -> None:
+        window = project_window()
+
+        window.canvas.set_contour(CONTOUR)
+
+        assert window._contour_analysis_cache is None
+        assert window._is_current_contour_analysis_outdated() is True
+        assert window.analysis_status_label.text() == ANALYSIS_OUTDATED_STATUS_TEXT
+        assert window.property_contour_pixels.text() == CONTOUR_ANALYSIS_OUTDATED_TEXT
+
+    def test_refresh_button_recalculates_every_panel(self, project_window) -> None:
+        window = project_window()
+        window.canvas.set_contour(CONTOUR)
+
+        window.refresh_analysis_button.click()
+
+        assert window._contour_analysis_cache is not None
+        for panel in self._panels(window):
+            assert panel.canvas.has_plot_data() is True
+        assert window.analysis_status_label.text() == ""
+        assert window.property_contour_pixels.text() != CONTOUR_ANALYSIS_OUTDATED_TEXT
+        assert int(window.property_contour_pixels.text()) > 0
+
+    def test_refresh_action_recalculates_project_summary(self, project_window) -> None:
+        window = project_window()
+        window.canvas.set_contour(CONTOUR)
+
+        assert window.project_mean_red.text() == "-"
+
+        window.refresh_analysis_action.trigger()
+
+        assert window.project_mean_red.text() != "-"
+
+    def test_moving_a_node_marks_the_analysis_as_outdated(self, project_window) -> None:
+        window = project_window()
+        window.canvas.set_contour(CONTOUR)
+        window.refresh_analysis()
+
+        assert window.analysis_status_label.text() == ""
+
+        window.canvas.set_contour([Point(2, 2), Point(30, 2), Point(30, 20)])
+
+        assert window.analysis_status_label.text() == ANALYSIS_OUTDATED_STATUS_TEXT
+        assert window.property_contour_pixels.text() == CONTOUR_ANALYSIS_OUTDATED_TEXT
+
+    def test_refresh_is_disabled_without_a_project(
+        self, qapp, dialogs: dict[str, Any]
+    ) -> None:
+        window = MainWindow()
+        try:
+            assert window.refresh_analysis_action.isEnabled() is False
+            assert window.refresh_analysis_button.isEnabled() is False
+        finally:
+            window.close()
+            window.deleteLater()
+
+
+class TestHistogramFileNames:
     def test_default_histogram_file_name_follows_image(self, project_window) -> None:
         window = project_window()
 

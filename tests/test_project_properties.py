@@ -239,6 +239,8 @@ def _add_test_contour(window: MainWindow) -> None:
         points=points,
     )
     window.canvas.set_contour(points)
+    # Аналитика считается только по команде «Обновить».
+    window.refresh_analysis()
     window._update_project_properties()
     window._update_action_states()
 
@@ -1005,6 +1007,8 @@ class ProjectPropertiesTest(unittest.TestCase):
 
             window = MainWindow()
             window._set_project(project_path, load_project(project_path))
+            # Аналитика считается только по команде «Обновить».
+            window.refresh_analysis()
 
             self.assertTrue(window.canvas.has_image())
             # Канвас хранит разрешённый путь: на macOS /var — симлинк на /private/var.
@@ -1030,6 +1034,7 @@ class ProjectPropertiesTest(unittest.TestCase):
                     Point(1, 18),
                 ]
             )
+            window.refresh_analysis()
 
             self.assertEqual(window.property_points.text(), "4")
             self.assertEqual(window.property_contour_pixels.text(), "324")
@@ -2414,6 +2419,8 @@ class ProjectPropertiesTest(unittest.TestCase):
 
             window = MainWindow()
             window._set_project(project_path, load_project(project_path))
+            # Аналитика считается только по команде «Обновить».
+            window.refresh_analysis()
 
             self.assertEqual(window.property_contour_pixels.text(), "324")
             self.assertEqual(window.property_contour_area_mm2.text(), "36 мм²")
@@ -2430,6 +2437,7 @@ class ProjectPropertiesTest(unittest.TestCase):
                     Point(1, 9),
                 ]
             )
+            window.refresh_analysis()
 
             self.assertEqual(window.property_contour_pixels.text(), "81")
             self.assertEqual(window.property_contour_area_mm2.text(), "9 мм²")
@@ -2559,6 +2567,8 @@ class ProjectPropertiesTest(unittest.TestCase):
 
             window = MainWindow()
             window._set_project(project_path, load_project(project_path))
+            # Аналитика считается только по команде «Обновить».
+            window.refresh_analysis()
 
             self.assertEqual(window.property_lab_l.text(), "38")
             self.assertEqual(window.property_lab_a.text(), "12")
@@ -2581,6 +2591,7 @@ class ProjectPropertiesTest(unittest.TestCase):
                     Point(11, 18),
                 ]
             )
+            window.refresh_analysis()
 
             self.assertEqual(window.property_lab_l.text(), "6")
             self.assertEqual(window.property_lab_a.text(), "0")
@@ -2768,6 +2779,8 @@ class ProjectPropertiesTest(unittest.TestCase):
 
             window = MainWindow()
             window._set_project(project_path, load_project(project_path))
+            # Аналитика считается только по команде «Обновить».
+            window.refresh_analysis()
 
             self.assertEqual(window.project_mean_red.text(), "55")
             self.assertEqual(window.project_mean_green.text(), "35")
@@ -2793,6 +2806,7 @@ class ProjectPropertiesTest(unittest.TestCase):
                     Point(1, 4),
                 ]
             )
+            window.refresh_analysis()
 
             self.assertEqual(window.project_mean_red.text(), "14")
             self.assertEqual(window.project_mean_green.text(), "21")
