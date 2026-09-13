@@ -25,7 +25,10 @@ class DownscalePreset:
 DOWNSCALE_PRESETS: tuple[DownscalePreset, ...] = (
     DownscalePreset("1920×1080 (Full HD)", 1920, 1080),
     DownscalePreset("1280×720 (HD)", 1280, 720),
+    DownscalePreset("800×600 (SVGA)", 800, 600),
+    DownscalePreset("600×450", 600, 450),
 )
+RECOMMENDED_PRESET_INDEX = 2
 
 
 def read_image_size(path: str | Path) -> tuple[int, int]:
@@ -90,37 +93,16 @@ def fit_size(size: tuple[int, int], preset: DownscalePreset) -> tuple[int, int]:
     return max(1, round(width * scale)), max(1, round(height * scale))
 
 
-def downscale_image_file(
-    source: str | Path,
-    destination: str | Path,
-    preset: DownscalePreset,
-) -> tuple[int, int]:
-    """Сохраняет в destination уменьшенную копию source и возвращает её размер.
-
-    Запись атомарная, поэтому source и destination могут совпадать.
-    """
-    source_path = _checked_raster_path(source)
-    destination_path = Path(destination)
-    try:
-        with Image.open(source_path) as image:
-            target_size = fit_size(image.size, preset)
-            if image.format == "JPEG":
-                image.draft(image.mode, target_size)
-            image_info = dict(image.info)
-            working = _resizable_image(image)
-            if working.size != target_size:
-                working = working.resize(
-                    target_size,
-                    Image.Resampling.LANCZOS,
-                    reducing_gap=RESIZE_REDUCING_GAP,
-                )
-    except UnidentifiedImageError as exc:
-        raise ValueError(
-            "Не удалось распознать файл как растровое изображение."
-        ) from exc
-
-    _save_atomically(working, destination_path, image_info)
-    return working.size
+def reducing_presets(
+    size: tuple[int, int],
+) -> list[tuple[DownscalePreset, tuple[int, int]]]:
+    """Пресеты, которые действительно уменьшают изображение, с итоговыми размерами."""
+    options: list[tuple[DownscalePreset, tuple[int, int]]] = []
+    for preset in DOWNSCALE_PRESETS:
+        target_size = fit_size(size, preset)
+        if target_size != tuple(size):
+            options.append((preset, target_size))
+    return options
 
 
 def _checked_raster_path(path: str | Path) -> Path:

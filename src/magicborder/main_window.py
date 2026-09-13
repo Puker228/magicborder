@@ -73,20 +73,28 @@ from .contour_analysis import (
     mean_lms_values_from_total,
     yuv_values_from_rgb_pixels,
 )
+from .crop_dialog import CropDialog
 from .detector import detect_leaf_contour
 from .histograms import (
     HistogramPanel,
     rgb_to_lms,
 )
 from .icons import ACTION_VISUALS, TOOLBAR_ICON_SIZE, apply_action_visual, load_icon
+from .image_crop import (
+    CropBox,
+    apply_crop_to_record,
+    crop_image_file,
+    full_crop_box,
+    is_noop_crop,
+)
 from .image_downscale import (
     DOWNSCALE_PRESETS,
     LARGE_IMAGE_THRESHOLD,
+    RECOMMENDED_PRESET_INDEX,
     DownscalePreset,
-    downscale_image_file,
-    fit_size,
     is_large_image,
     read_image_header,
+    reducing_presets,
     verify_raster_image,
 )
 from .io_utils import (
@@ -142,10 +150,11 @@ HISTOGRAM_MANUAL_REFRESH_TEXT = (
     "Нажмите «Обновить», чтобы построить гистограммы по текущему контуру."
 )
 ANALYSIS_OUTDATED_STATUS_TEXT = "Данные устарели"
-DOWNSCALE_CANCELLED = "cancel"
-LARGE_IMAGE_LIST_LIMIT = 8
 IMAGE_PREPARE_CANCELLED_TEXT = "Отменено пользователем."
 IMAGE_PREPARE_PROGRESS_DELAY_MS = 300
+CROP_KEPT_STATUS_TEXT = "Фотография оставлена без изменений."
+DOWNSCALE_DIALOG_TITLE = "Понижение разрешения"
+KEEP_RESOLUTION_TEXT = "Оставить исходное разрешение"
 BACKGROUND_TASK_SHUTDOWN_TIMEOUT_MS = 2000
 ContourAnalysisCacheKey = tuple[str | None, str | None, ContourSignature]
 # Путь, mtime_ns и размер файла + сигнатура контура: если меняется файл
@@ -225,14 +234,21 @@ class _ContourAnalysisWorker(QRunnable):
 class ImageImportCandidate:
     source: Path
     label: str
-    size: tuple[int, int]
     captured_at: str
 
 
 @dataclass(frozen=True, slots=True)
 class ImagePrepareJob:
+    """Подготовка файла изображения в пуле потоков.
+
+    Без crop файл только проверяется и при необходимости копируется байт в байт:
+    при импорте разрешение не меняется. Обрезка и понижение разрешения
+    выполняются явно, после подтверждения пользователем.
+    """
+
     source: Path
     destination: Path
+    crop: CropBox | None = None
     preset: DownscalePreset | None = None
 
 
@@ -240,18 +256,21 @@ class ImagePrepareJob:
 class ImagePrepareResult:
     width: int
     height: int
-    downscaled: bool
 
 
 def prepare_image_file(job: ImagePrepareJob) -> ImagePrepareResult:
+    if job.crop is not None:
+        width, height = crop_image_file(
+            job.source, job.destination, job.crop, job.preset
+        )
+        return ImagePrepareResult(width, height)
     if job.preset is not None:
-        width, height = downscale_image_file(job.source, job.destination, job.preset)
-        return ImagePrepareResult(width, height, downscaled=True)
+        raise ValueError("Понижение разрешения выполняется только вместе с обрезкой.")
 
     width, height = verify_raster_image(job.source)
     if job.source.resolve() != job.destination.resolve():
         shutil.copy2(job.source, job.destination)
-    return ImagePrepareResult(width, height, downscaled=False)
+    return ImagePrepareResult(width, height)
 
 
 class _ImagePrepareWorkerSignals(QObject):
@@ -697,6 +716,7 @@ class MainWindow(QMainWindow):
         self.project_path: Path | None = None
         self._current_project_image_id: str | None = None
         self._loading_project_image = False
+        self._crop_dialog_open = False
         self._updating_project_list = False
         self._updating_project_identity_fields = False
         self._updating_project_info_fields = False
@@ -2144,6 +2164,10 @@ class MainWindow(QMainWindow):
         self.actual_size_action.setShortcut("Ctrl+0")
         self.actual_size_action.triggered.connect(self.canvas.reset_zoom)
 
+        self.crop_image_action = QAction("Обрезать...", self)
+        self.crop_image_action.setShortcut("Ctrl+Shift+X")
+        self.crop_image_action.triggered.connect(lambda: self.crop_current_image())
+
         self.default_view_action = QAction("Вид по умолчанию", self)
         self.default_view_action.setShortcut("Ctrl+R")
         self.default_view_action.triggered.connect(self.restore_default_view)
@@ -2223,6 +2247,7 @@ class MainWindow(QMainWindow):
             "zoom_out": self.zoom_out_action,
             "fit_image": self.fit_image_action,
             "actual_size": self.actual_size_action,
+            "crop_image": self.crop_image_action,
             "default_view": self.default_view_action,
             "show_all_canvas_elements": self.show_all_canvas_elements_action,
             "hide_all_canvas_elements": self.hide_all_canvas_elements_action,
@@ -2265,6 +2290,7 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.zoom_out_action)
         view_menu.addAction(self.fit_image_action)
         view_menu.addAction(self.actual_size_action)
+        view_menu.addAction(self.crop_image_action)
         view_menu.addSeparator()
         view_menu.addAction(self.default_view_action)
         view_menu.addSeparator()
@@ -2318,6 +2344,7 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.zoom_out_action)
         toolbar.addAction(self.fit_image_action)
         toolbar.addAction(self.actual_size_action)
+        toolbar.addAction(self.crop_image_action)
         toolbar.addAction(self.default_view_action)
         toolbar.addSeparator()
         toolbar.addAction(self.show_all_canvas_elements_action)
@@ -2393,6 +2420,9 @@ class MainWindow(QMainWindow):
         )
         self.flatten_background_action.setEnabled(
             has_project_image and has_image and has_contour and not image_job_pending
+        )
+        self.crop_image_action.setEnabled(
+            has_project_image and has_image and not image_job_pending
         )
         self.calibrate_scale_action.setEnabled(has_project_image and has_image)
         self.reset_calibration_action.setEnabled(has_project_image and has_calibration)
@@ -2899,10 +2929,9 @@ class MainWindow(QMainWindow):
             [(Path(file_name), Path(file_name).name) for file_name in file_names],
             errors,
         )
-        preset = self._choose_large_image_downscale(candidates, overwrite=False)
-        if preset == DOWNSCALE_CANCELLED:
-            return
 
+        # Файлы копируются в исходном разрешении; обрезка и понижение разрешения
+        # предлагаются при первом открытии изображения.
         reserved_paths: set[Path] = set()
         jobs = [
             ImagePrepareJob(
@@ -2910,13 +2939,11 @@ class MainWindow(QMainWindow):
                 destination=_unique_destination_path(
                     image_dir, candidate.source.name, reserved=reserved_paths
                 ),
-                preset=preset if is_large_image(candidate.size) else None,
             )
             for candidate in candidates
         ]
         results = self._run_image_prepare_jobs(jobs)
 
-        downscaled_count = 0
         for candidate, job, result in zip(candidates, jobs, results, strict=True):
             if isinstance(result, str):
                 errors.append(f"{candidate.label}: {result}")
@@ -2936,17 +2963,13 @@ class MainWindow(QMainWindow):
             )
             self.project_document.images.append(record)
             added_ids.append(record.id)
-            downscaled_count += int(result.downscaled)
 
         if added_ids:
             self._refresh_project_list()
             self._select_project_image(added_ids[0])
             self._update_project_summary_properties()
             self._save_project_silently(show_error=True)
-            self.statusBar().showMessage(
-                f"Добавлено изображений: {len(added_ids)}"
-                + _downscaled_count_suffix(downscaled_count)
-            )
+            self.statusBar().showMessage(f"Добавлено изображений: {len(added_ids)}")
 
         if errors:
             self._show_warning("Не все изображения добавлены", "\n".join(errors[:8]))
@@ -2991,21 +3014,14 @@ class MainWindow(QMainWindow):
             untracked_paths.append((image_path, relative_path))
 
         candidates = self._probe_image_import_candidates(untracked_paths, errors)
-        preset = self._choose_large_image_downscale(candidates, overwrite=True)
-        if preset == DOWNSCALE_CANCELLED:
-            return
 
+        # Файлы в папке проекта только проверяются и не перезаписываются.
         jobs = [
-            ImagePrepareJob(
-                source=candidate.source,
-                destination=candidate.source,
-                preset=preset if is_large_image(candidate.size) else None,
-            )
+            ImagePrepareJob(source=candidate.source, destination=candidate.source)
             for candidate in candidates
         ]
         results = self._run_image_prepare_jobs(jobs)
 
-        downscaled_count = 0
         for candidate, result in zip(candidates, results, strict=True):
             if isinstance(result, str):
                 errors.append(f"{candidate.label}: {result}")
@@ -3030,7 +3046,6 @@ class MainWindow(QMainWindow):
             )
             self.project_document.images.append(record)
             added_ids.append(record.id)
-            downscaled_count += int(result.downscaled)
 
         if added_ids:
             self._refresh_project_list()
@@ -3039,7 +3054,6 @@ class MainWindow(QMainWindow):
             self._save_project_silently(show_error=True)
             self.statusBar().showMessage(
                 f"Синхронизировано изображений: {len(added_ids)}"
-                + _downscaled_count_suffix(downscaled_count)
             )
         else:
             self.statusBar().showMessage("Новых изображений не найдено.")
@@ -3055,8 +3069,7 @@ class MainWindow(QMainWindow):
         candidates: list[ImageImportCandidate] = []
         for source, label in sources:
             try:
-                # Размер и дата съёмки за одно открытие файла вместо двух.
-                size, captured_at = read_image_header(source)
+                _size, captured_at = read_image_header(source)
             except (OSError, ValueError) as exc:
                 errors.append(f"{label}: {exc}")
                 continue
@@ -3064,100 +3077,17 @@ class MainWindow(QMainWindow):
                 ImageImportCandidate(
                     source=source,
                     label=label,
-                    size=size,
                     captured_at=captured_at,
                 )
             )
         return candidates
 
-    def _choose_large_image_downscale(
-        self, candidates: list[ImageImportCandidate], *, overwrite: bool
-    ) -> DownscalePreset | str | None:
-        large_images = [
-            (candidate.label, candidate.size)
-            for candidate in candidates
-            if is_large_image(candidate.size)
-        ]
-        if not large_images:
-            return None
-        return self._ask_large_image_downscale(
-            large_images, len(candidates), overwrite=overwrite
-        )
-
-    def _ask_large_image_downscale(
-        self,
-        large_images: list[tuple[str, tuple[int, int]]],
-        total_count: int,
-        *,
-        overwrite: bool,
-    ) -> DownscalePreset | str | None:
-        """Возвращает выбранный пресет, None для оригинала или DOWNSCALE_CANCELLED."""
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Большие изображения")
-
-        threshold_width, threshold_height = LARGE_IMAGE_THRESHOLD
-        message_lines = [
-            f"{len(large_images)} из {total_count} изображений имеют разрешение "
-            f"от {threshold_width}×{threshold_height}. "
-            "Обработка больших файлов может быть медленной.",
-            "Уменьшить разрешение? Пропорции изображения сохраняются.",
-        ]
-        if overwrite:
-            message_lines.append(
-                "Файлы в папке проекта будут перезаписаны уменьшенными копиями."
-            )
-        message_label = QLabel("\n\n".join(message_lines), dialog)
-        message_label.setWordWrap(True)
-
-        listed_images = [
-            f"{label} — {width}×{height}"
-            for label, (width, height) in large_images[:LARGE_IMAGE_LIST_LIMIT]
-        ]
-        hidden_count = len(large_images) - len(listed_images)
-        if hidden_count > 0:
-            listed_images.append(f"…и ещё {hidden_count}")
-        images_label = QLabel("\n".join(listed_images), dialog)
-        images_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-
-        example_label, example_size = large_images[0]
-        preset_buttons: list[tuple[QRadioButton, DownscalePreset | None]] = []
-        for index, preset in enumerate(DOWNSCALE_PRESETS):
-            text = preset.label + (" — рекомендуется" if index == 0 else "")
-            button = QRadioButton(text, dialog)
-            target_width, target_height = fit_size(example_size, preset)
-            button.setToolTip(
-                f"{example_label}: {example_size[0]}×{example_size[1]} → "
-                f"{target_width}×{target_height}"
-            )
-            preset_buttons.append((button, preset))
-        original_button = QRadioButton("Оставить оригинальное разрешение", dialog)
-        preset_buttons.append((original_button, None))
-        preset_buttons[0][0].setChecked(True)
-
-        button_box = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dialog
-        )
-        button_box.accepted.connect(dialog.accept)
-        button_box.rejected.connect(dialog.reject)
-
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
-        layout.addWidget(message_label)
-        layout.addWidget(images_label)
-        for button, _preset in preset_buttons:
-            layout.addWidget(button)
-        layout.addWidget(button_box)
-
-        if dialog.exec_() != QDialog.Accepted:
-            return DOWNSCALE_CANCELLED
-        for button, preset in preset_buttons:
-            if button.isChecked():
-                return preset
-        return None
-
     def _run_image_prepare_jobs(
-        self, jobs: list[ImagePrepareJob]
+        self,
+        jobs: list[ImagePrepareJob],
+        *,
+        title: str = "Добавление изображений",
+        label: str = "Подготовка изображений…",
     ) -> list[ImagePrepareResult | str]:
         """Выполняет задачи в пуле потоков, не блокируя цикл событий Qt."""
         if not jobs:
@@ -3168,10 +3098,8 @@ class MainWindow(QMainWindow):
         cancel_event = threading.Event()
         loop = QEventLoop(self)
 
-        progress = QProgressDialog(
-            "Подготовка изображений…", "Отмена", 0, len(jobs), self
-        )
-        progress.setWindowTitle("Добавление изображений")
+        progress = QProgressDialog(label, "Отмена", 0, len(jobs), self)
+        progress.setWindowTitle(title)
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(IMAGE_PREPARE_PROGRESS_DELAY_MS)
         progress.setAutoClose(False)
@@ -4347,6 +4275,225 @@ class MainWindow(QMainWindow):
             "Фон за пределами контура выровнен до белого, изображение сохранено."
         )
 
+    def crop_current_image(self, *, initial: bool = False) -> bool:
+        """Обрезка и необязательное понижение разрешения; True, если файл изменён."""
+        if self._crop_dialog_open:
+            return False
+        record = self._current_project_image()
+        if record is None or not self.canvas.has_image():
+            if not initial:
+                self._show_warning(
+                    "Нет изображения", "Сначала выберите изображение проекта."
+                )
+            return False
+        if (
+            self._pending_contour_detection is not None
+            or self._pending_flatten_background is not None
+        ):
+            if not initial:
+                self._show_warning(
+                    "Изображение занято",
+                    "Дождитесь завершения фоновой обработки изображения.",
+                )
+            return False
+
+        image_path = self._project_image_path(record)
+        if not image_path.exists():
+            if not initial:
+                self._show_error(
+                    "Не удалось обрезать изображение",
+                    f"Файл изображения не найден: {image_path}",
+                )
+            return False
+
+        self._store_current_angle_measurements()
+        self._store_current_segment_measurements()
+        self._save_current_project_annotation()
+
+        image_size = self.canvas.image_size()
+        if image_size is None:
+            return False
+
+        # Шаг 1: обрезка в исходном разрешении.
+        self._crop_dialog_open = True
+        try:
+            chosen_box = self._exec_crop_dialog(record)
+            self._mark_crop_reviewed(record)
+            if record.id != self._current_project_image_id:
+                return False
+            # «Оставить как есть» отказывается только от обрезки: кадр остаётся
+            # целым, а понизить разрешение всё равно предлагается.
+            crop_box = chosen_box or full_crop_box(image_size)
+
+            # Шаг 2: необязательное понижение разрешения.
+            preset = None
+            if reducing_presets(crop_box.size):
+                preset = self._exec_downscale_dialog(
+                    record, crop_box.size, cropped=not crop_box.is_full(image_size)
+                )
+        finally:
+            self._crop_dialog_open = False
+
+        if is_noop_crop(crop_box, preset, image_size):
+            self.statusBar().showMessage(CROP_KEPT_STATUS_TEXT)
+            return False
+
+        # Обрезка и уменьшение записываются одним сохранением, без промежуточного
+        # файла и повторного сжатия JPEG.
+        (result,) = self._run_image_prepare_jobs(
+            [ImagePrepareJob(image_path, image_path, crop=crop_box, preset=preset)],
+            title="Обработка изображения",
+            label="Сохранение изображения…",
+        )
+        if isinstance(result, str):
+            # Запись атомарная: при ошибке файл и запись проекта остаются прежними.
+            if result != IMAGE_PREPARE_CANCELLED_TEXT:
+                self._show_error("Не удалось обработать изображение", result)
+            return False
+
+        output_size = (result.width, result.height)
+        apply_crop_to_record(record, crop_box, output_size)
+        self._invalidate_current_contour_analysis()
+        self._project_mean_color_stats_cache = None
+        # Перечитываем кадр с диска: канвас получает новый размер сцены и вписывает
+        # изображение в окно, а пересчитанные контур и измерения совпадают по размеру.
+        self._load_project_image(record)
+        self._save_project_silently(show_error=True)
+        self.statusBar().showMessage(
+            _image_processed_status(
+                cropped=not crop_box.is_full(image_size),
+                downscaled=output_size != crop_box.size,
+                size=output_size,
+            )
+        )
+        return True
+
+    def _exec_crop_dialog(self, record: ProjectImageRecord) -> CropBox | None:
+        pixmap = self.canvas.current_pixmap()
+        if pixmap is None:
+            return None
+        has_geometry = bool(
+            record.annotation is not None
+            or record.calibration is not None
+            or record.measurements.angles
+            or record.measurements.segments
+        )
+        dialog = CropDialog(
+            pixmap,
+            display_name=record.display_name,
+            geometry_note=has_geometry,
+            parent=self,
+        )
+        try:
+            if dialog.exec_() != QDialog.Accepted:
+                return None
+            return dialog.crop_box()
+        finally:
+            dialog.deleteLater()
+
+    def _exec_downscale_dialog(
+        self,
+        record: ProjectImageRecord,
+        size: tuple[int, int],
+        *,
+        cropped: bool,
+    ) -> DownscalePreset | None:
+        """Предлагает понизить разрешение; None — сохранить исходное разрешение."""
+        width, height = size
+        dialog = QDialog(self)
+        dialog.setWindowTitle(DOWNSCALE_DIALOG_TITLE)
+        dialog.setMinimumWidth(460)
+
+        size_text = "после обрезки" if cropped else "изображения"
+        message_lines = [
+            f"{record.display_name}: размер {size_text} — {width}×{height} px.",
+            "Понизить разрешение перед сохранением? Пропорции сохраняются.",
+        ]
+        if is_large_image(size):
+            threshold_width, threshold_height = LARGE_IMAGE_THRESHOLD
+            message_lines.append(
+                f"Разрешение от {threshold_width}×{threshold_height}: "
+                "обработка такого изображения может быть медленной."
+            )
+        message_label = QLabel("\n\n".join(message_lines), dialog)
+        message_label.setWordWrap(True)
+
+        # По умолчанию разрешение сохраняется: уменьшение — только явный выбор.
+        original_button = QRadioButton(
+            f"{KEEP_RESOLUTION_TEXT} ({width}×{height})", dialog
+        )
+        original_button.setChecked(True)
+        preset_buttons: list[tuple[QRadioButton, DownscalePreset | None]] = [
+            (original_button, None)
+        ]
+        for preset, (target_width, target_height) in reducing_presets(size):
+            recommended = (
+                " — рекомендуется"
+                if preset is DOWNSCALE_PRESETS[RECOMMENDED_PRESET_INDEX]
+                and is_large_image(size)
+                else ""
+            )
+            button = QRadioButton(
+                f"{preset.label} → {target_width}×{target_height}{recommended}",
+                dialog,
+            )
+            preset_buttons.append((button, preset))
+
+        note_label = QLabel(
+            "При уменьшении файл изображения в папке проекта будет перезаписан.",
+            dialog,
+        )
+        note_label.setWordWrap(True)
+        note_label.setStyleSheet("color: #5f6b7a;")
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok, dialog)
+        button_box.button(QDialogButtonBox.Ok).setText("Продолжить")
+        button_box.accepted.connect(dialog.accept)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        layout.addWidget(message_label)
+        for button, _preset in preset_buttons:
+            layout.addWidget(button)
+        layout.addWidget(note_label)
+        layout.addWidget(button_box)
+
+        try:
+            # Закрытие окна или Esc означают отказ от уменьшения, а не отмену обрезки.
+            if dialog.exec_() != QDialog.Accepted:
+                return None
+            for button, preset in preset_buttons:
+                if button.isChecked():
+                    return preset
+            return None
+        finally:
+            dialog.deleteLater()
+
+    def _mark_crop_reviewed(self, record: ProjectImageRecord) -> None:
+        if record.crop_reviewed:
+            return
+        record.crop_reviewed = True
+        self._schedule_project_save()
+
+    def _schedule_crop_prompt(self, record_id: str) -> None:
+        # Диалог откладывается до следующего прохода цикла событий, чтобы выбор
+        # в списке и загрузка кадра завершились до модального окна.
+        QTimer.singleShot(0, lambda: self._maybe_prompt_crop(record_id))
+
+    def _maybe_prompt_crop(self, record_id: str) -> None:
+        record = self._current_project_image()
+        if (
+            record is None
+            or record.id != record_id
+            or record.crop_reviewed
+            or self._crop_dialog_open
+            or not self.canvas.has_image()
+            or QApplication.activeModalWidget() is not None
+        ):
+            return
+        self.crop_current_image(initial=True)
+
     def start_scale_calibration(self) -> None:
         if self._selected_project_image() is None or not self.canvas.has_image():
             self._show_warning(
@@ -5240,6 +5387,8 @@ class MainWindow(QMainWindow):
         self._update_project_properties()
         self._update_action_states()
         self._update_window_title()
+        if loaded_ok and not record.crop_reviewed:
+            self._schedule_crop_prompt(record.id)
 
     def _handle_contour_geometry_changed(self) -> None:
         if self._loading_project_image:
@@ -6929,6 +7078,18 @@ def _circle_contour_points(width: int, height: int, node_count: int) -> list[Poi
     return points
 
 
+def _image_processed_status(
+    *, cropped: bool, downscaled: bool, size: tuple[int, int]
+) -> str:
+    if cropped and downscaled:
+        action = "Изображение обрезано и уменьшено"
+    elif cropped:
+        action = "Изображение обрезано"
+    else:
+        action = "Разрешение изображения понижено"
+    return f"{action}: {size[0]}×{size[1]}"
+
+
 def _current_timestamp() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -7033,10 +7194,6 @@ def _project_name_from_field_text(raw_name: str) -> str | None:
 
 def _project_relative_path_key(value: str) -> str:
     return str(value or "").replace("\\", "/").strip("/")
-
-
-def _downscaled_count_suffix(downscaled_count: int) -> str:
-    return f" (уменьшено: {downscaled_count})" if downscaled_count else ""
 
 
 def _unique_destination_path(

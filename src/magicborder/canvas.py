@@ -695,6 +695,9 @@ class ImageCanvas(QGraphicsView):
     def current_image_path(self) -> Path | None:
         return self._loaded_image.path if self._loaded_image else None
 
+    def current_pixmap(self) -> QPixmap | None:
+        return self._loaded_image.pixmap if self._loaded_image else None
+
     def image_size(self) -> tuple[int, int] | None:
         if not self._loaded_image:
             return None
