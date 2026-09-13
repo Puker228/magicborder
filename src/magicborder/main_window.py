@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import shutil
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +12,7 @@ import numpy as np
 from PIL import Image
 from PyQt5.QtCore import (
     QDateTime,
+    QEventLoop,
     QObject,
     QRunnable,
     QSignalBlocker,
@@ -40,6 +42,8 @@ from PyQt5.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
+    QRadioButton,
     QSizePolicy,
     QSplitter,
     QTextEdit,
@@ -69,6 +73,16 @@ from .histograms import (
     rgb_to_lms,
 )
 from .icons import ACTION_VISUALS, TOOLBAR_ICON_SIZE, apply_action_visual, load_icon
+from .image_downscale import (
+    DOWNSCALE_PRESETS,
+    LARGE_IMAGE_THRESHOLD,
+    DownscalePreset,
+    downscale_image_file,
+    fit_size,
+    is_large_image,
+    read_image_size,
+    verify_raster_image,
+)
 from .io_utils import (
     SUPPORTED_RASTER_SUFFIXES,
     image_open_filter,
@@ -121,6 +135,10 @@ HISTOGRAM_MANUAL_REFRESH_TEXT = (
     "Нажмите «Обновить», чтобы построить гистограммы по текущему контуру."
 )
 ANALYSIS_OUTDATED_STATUS_TEXT = "Данные устарели"
+DOWNSCALE_CANCELLED = "cancel"
+LARGE_IMAGE_LIST_LIMIT = 8
+IMAGE_PREPARE_CANCELLED_TEXT = "Отменено пользователем."
+IMAGE_PREPARE_PROGRESS_DELAY_MS = 300
 ContourAnalysisCacheKey = tuple[str | None, str | None, ContourSignature]
 ProjectMeanColorStats = tuple[
     tuple[int, int, int],
@@ -190,6 +208,66 @@ class _ContourAnalysisWorker(QRunnable):
                 analysis=analysis,
             )
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ImageImportCandidate:
+    source: Path
+    label: str
+    size: tuple[int, int]
+    captured_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ImagePrepareJob:
+    source: Path
+    destination: Path
+    preset: DownscalePreset | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ImagePrepareResult:
+    width: int
+    height: int
+    downscaled: bool
+
+
+def prepare_image_file(job: ImagePrepareJob) -> ImagePrepareResult:
+    if job.preset is not None:
+        width, height = downscale_image_file(job.source, job.destination, job.preset)
+        return ImagePrepareResult(width, height, downscaled=True)
+
+    width, height = verify_raster_image(job.source)
+    if job.source.resolve() != job.destination.resolve():
+        shutil.copy2(job.source, job.destination)
+    return ImagePrepareResult(width, height, downscaled=False)
+
+
+class _ImagePrepareWorkerSignals(QObject):
+    finished = pyqtSignal(int, object)
+    failed = pyqtSignal(int, str)
+
+
+class _ImagePrepareWorker(QRunnable):
+    def __init__(
+        self, index: int, job: ImagePrepareJob, cancel_event: threading.Event
+    ) -> None:
+        super().__init__()
+        self.signals = _ImagePrepareWorkerSignals()
+        self._index = index
+        self._job = job
+        self._cancel_event = cancel_event
+
+    def run(self) -> None:
+        if self._cancel_event.is_set():
+            self.signals.failed.emit(self._index, IMAGE_PREPARE_CANCELLED_TEXT)
+            return
+        try:
+            result = prepare_image_file(self._job)
+        except Exception as exc:  # defensive boundary for worker failures
+            self.signals.failed.emit(self._index, str(exc))
+            return
+        self.signals.finished.emit(self._index, result)
 
 
 class AverageColorSwatch(QFrame):
@@ -439,6 +517,7 @@ class MainWindow(QMainWindow):
             self._update_project_summary_properties
         )
         self._contour_analysis_thread_pool = QThreadPool.globalInstance()
+        self._image_prepare_thread_pool = QThreadPool(self)
         self._contour_analysis_request_id = 0
         self._contour_analysis_cache: ContourAnalysisWorkResult | None = None
         self._project_mean_color_stats_cache: ProjectMeanColorStats | None = None
@@ -2628,38 +2707,58 @@ class MainWindow(QMainWindow):
             )
             return
 
-        for file_name in file_names:
-            source_path = Path(file_name)
-            try:
-                loaded_image = load_raster_image(source_path)
-                destination_path = _unique_destination_path(image_dir, source_path.name)
-                if source_path.resolve() != destination_path.resolve():
-                    shutil.copy2(source_path, destination_path)
-            except (OSError, ValueError) as exc:
-                errors.append(f"{source_path.name}: {exc}")
+        candidates = self._probe_image_import_candidates(
+            [(Path(file_name), Path(file_name).name) for file_name in file_names],
+            errors,
+        )
+        preset = self._choose_large_image_downscale(candidates, overwrite=False)
+        if preset == DOWNSCALE_CANCELLED:
+            return
+
+        reserved_paths: set[Path] = set()
+        jobs = [
+            ImagePrepareJob(
+                source=candidate.source,
+                destination=_unique_destination_path(
+                    image_dir, candidate.source.name, reserved=reserved_paths
+                ),
+                preset=preset if is_large_image(candidate.size) else None,
+            )
+            for candidate in candidates
+        ]
+        results = self._run_image_prepare_jobs(jobs)
+
+        downscaled_count = 0
+        for candidate, job, result in zip(candidates, jobs, results, strict=True):
+            if isinstance(result, str):
+                errors.append(f"{candidate.label}: {result}")
                 continue
 
             record_id = self._new_project_image_id()
             record = ProjectImageRecord(
                 id=record_id,
-                relative_path=portable_path_reference(destination_path, project_dir),
-                display_name=destination_path.name,
-                image_width=loaded_image.width,
-                image_height=loaded_image.height,
+                relative_path=portable_path_reference(job.destination, project_dir),
+                display_name=job.destination.name,
+                image_width=result.width,
+                image_height=result.height,
                 metadata=default_project_image_metadata(
                     added_at=_current_timestamp(),
-                    captured_at=read_image_captured_at(source_path),
+                    captured_at=candidate.captured_at,
                 ),
             )
             self.project_document.images.append(record)
             added_ids.append(record.id)
+            downscaled_count += int(result.downscaled)
 
         if added_ids:
             self._refresh_project_list()
             self._select_project_image(added_ids[0])
             self._update_project_summary_properties()
             self._save_project_silently(show_error=True)
-            self.statusBar().showMessage(f"Добавлено изображений: {len(added_ids)}")
+            self.statusBar().showMessage(
+                f"Добавлено изображений: {len(added_ids)}"
+                + _downscaled_count_suffix(downscaled_count)
+            )
 
         if errors:
             self._show_warning("Не все изображения добавлены", "\n".join(errors[:8]))
@@ -2694,17 +2793,34 @@ class MainWindow(QMainWindow):
             _project_relative_path_key(record.relative_path)
             for record in self.project_document.images
         }
-
+        untracked_paths: list[tuple[Path, str]] = []
         for image_path in candidate_paths:
             relative_path = portable_path_reference(image_path, project_dir)
             relative_path_key = _project_relative_path_key(relative_path)
             if relative_path_key in existing_paths:
                 continue
+            existing_paths.add(relative_path_key)
+            untracked_paths.append((image_path, relative_path))
 
-            try:
-                loaded_image = load_raster_image(image_path)
-            except (OSError, ValueError) as exc:
-                errors.append(f"{relative_path}: {exc}")
+        candidates = self._probe_image_import_candidates(untracked_paths, errors)
+        preset = self._choose_large_image_downscale(candidates, overwrite=True)
+        if preset == DOWNSCALE_CANCELLED:
+            return
+
+        jobs = [
+            ImagePrepareJob(
+                source=candidate.source,
+                destination=candidate.source,
+                preset=preset if is_large_image(candidate.size) else None,
+            )
+            for candidate in candidates
+        ]
+        results = self._run_image_prepare_jobs(jobs)
+
+        downscaled_count = 0
+        for candidate, result in zip(candidates, results, strict=True):
+            if isinstance(result, str):
+                errors.append(f"{candidate.label}: {result}")
                 continue
 
             try:
@@ -2715,18 +2831,18 @@ class MainWindow(QMainWindow):
 
             record = ProjectImageRecord(
                 id=record_id,
-                relative_path=relative_path,
-                display_name=image_path.name,
-                image_width=loaded_image.width,
-                image_height=loaded_image.height,
+                relative_path=candidate.label,
+                display_name=candidate.source.name,
+                image_width=result.width,
+                image_height=result.height,
                 metadata=default_project_image_metadata(
                     added_at=_current_timestamp(),
-                    captured_at=read_image_captured_at(image_path),
+                    captured_at=candidate.captured_at,
                 ),
             )
             self.project_document.images.append(record)
-            existing_paths.add(relative_path_key)
             added_ids.append(record.id)
+            downscaled_count += int(result.downscaled)
 
         if added_ids:
             self._refresh_project_list()
@@ -2735,6 +2851,7 @@ class MainWindow(QMainWindow):
             self._save_project_silently(show_error=True)
             self.statusBar().showMessage(
                 f"Синхронизировано изображений: {len(added_ids)}"
+                + _downscaled_count_suffix(downscaled_count)
             )
         else:
             self.statusBar().showMessage("Новых изображений не найдено.")
@@ -2743,6 +2860,168 @@ class MainWindow(QMainWindow):
             self._show_warning(
                 "Не все изображения синхронизированы", "\n".join(errors[:8])
             )
+
+    def _probe_image_import_candidates(
+        self, sources: list[tuple[Path, str]], errors: list[str]
+    ) -> list[ImageImportCandidate]:
+        candidates: list[ImageImportCandidate] = []
+        for source, label in sources:
+            try:
+                size = read_image_size(source)
+            except (OSError, ValueError) as exc:
+                errors.append(f"{label}: {exc}")
+                continue
+            candidates.append(
+                ImageImportCandidate(
+                    source=source,
+                    label=label,
+                    size=size,
+                    captured_at=read_image_captured_at(source),
+                )
+            )
+        return candidates
+
+    def _choose_large_image_downscale(
+        self, candidates: list[ImageImportCandidate], *, overwrite: bool
+    ) -> DownscalePreset | str | None:
+        large_images = [
+            (candidate.label, candidate.size)
+            for candidate in candidates
+            if is_large_image(candidate.size)
+        ]
+        if not large_images:
+            return None
+        return self._ask_large_image_downscale(
+            large_images, len(candidates), overwrite=overwrite
+        )
+
+    def _ask_large_image_downscale(
+        self,
+        large_images: list[tuple[str, tuple[int, int]]],
+        total_count: int,
+        *,
+        overwrite: bool,
+    ) -> DownscalePreset | str | None:
+        """Возвращает выбранный пресет, None для оригинала или DOWNSCALE_CANCELLED."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Большие изображения")
+
+        threshold_width, threshold_height = LARGE_IMAGE_THRESHOLD
+        message_lines = [
+            f"{len(large_images)} из {total_count} изображений имеют разрешение "
+            f"от {threshold_width}×{threshold_height}. "
+            "Обработка больших файлов может быть медленной.",
+            "Уменьшить разрешение? Пропорции изображения сохраняются.",
+        ]
+        if overwrite:
+            message_lines.append(
+                "Файлы в папке проекта будут перезаписаны уменьшенными копиями."
+            )
+        message_label = QLabel("\n\n".join(message_lines), dialog)
+        message_label.setWordWrap(True)
+
+        listed_images = [
+            f"{label} — {width}×{height}"
+            for label, (width, height) in large_images[:LARGE_IMAGE_LIST_LIMIT]
+        ]
+        hidden_count = len(large_images) - len(listed_images)
+        if hidden_count > 0:
+            listed_images.append(f"…и ещё {hidden_count}")
+        images_label = QLabel("\n".join(listed_images), dialog)
+        images_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        example_label, example_size = large_images[0]
+        preset_buttons: list[tuple[QRadioButton, DownscalePreset | None]] = []
+        for index, preset in enumerate(DOWNSCALE_PRESETS):
+            text = preset.label + (" — рекомендуется" if index == 0 else "")
+            button = QRadioButton(text, dialog)
+            target_width, target_height = fit_size(example_size, preset)
+            button.setToolTip(
+                f"{example_label}: {example_size[0]}×{example_size[1]} → "
+                f"{target_width}×{target_height}"
+            )
+            preset_buttons.append((button, preset))
+        original_button = QRadioButton("Оставить оригинальное разрешение", dialog)
+        preset_buttons.append((original_button, None))
+        preset_buttons[0][0].setChecked(True)
+
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dialog
+        )
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        layout.addWidget(message_label)
+        layout.addWidget(images_label)
+        for button, _preset in preset_buttons:
+            layout.addWidget(button)
+        layout.addWidget(button_box)
+
+        if dialog.exec_() != QDialog.Accepted:
+            return DOWNSCALE_CANCELLED
+        for button, preset in preset_buttons:
+            if button.isChecked():
+                return preset
+        return None
+
+    def _run_image_prepare_jobs(
+        self, jobs: list[ImagePrepareJob]
+    ) -> list[ImagePrepareResult | str]:
+        """Выполняет задачи в пуле потоков, не блокируя цикл событий Qt."""
+        if not jobs:
+            return []
+
+        results: list[ImagePrepareResult | str | None] = [None] * len(jobs)
+        remaining = len(jobs)
+        cancel_event = threading.Event()
+        loop = QEventLoop(self)
+
+        progress = QProgressDialog(
+            "Подготовка изображений…", "Отмена", 0, len(jobs), self
+        )
+        progress.setWindowTitle("Добавление изображений")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(IMAGE_PREPARE_PROGRESS_DELAY_MS)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        progress.canceled.connect(cancel_event.set)
+
+        def store_result(index: int, result: ImagePrepareResult | str) -> None:
+            nonlocal remaining
+            if results[index] is not None:
+                return
+            results[index] = result
+            remaining -= 1
+            progress.setValue(len(jobs) - remaining)
+            if remaining == 0:
+                loop.quit()
+
+        workers: list[_ImagePrepareWorker] = []
+        for index, job in enumerate(jobs):
+            worker = _ImagePrepareWorker(index, job, cancel_event)
+            worker.signals.finished.connect(store_result)
+            worker.signals.failed.connect(store_result)
+            workers.append(worker)
+            self._image_prepare_thread_pool.start(worker)
+
+        QApplication.setOverrideCursor(Qt.BusyCursor)
+        try:
+            if remaining:
+                loop.exec_()
+        finally:
+            QApplication.restoreOverrideCursor()
+            progress.canceled.disconnect()
+            progress.close()
+            progress.deleteLater()
+
+        return [
+            result if result is not None else IMAGE_PREPARE_CANCELLED_TEXT
+            for result in results
+        ]
 
     def remove_selected_project_image(self) -> None:
         if self.project_document is None or self.project_path is None:
@@ -6312,13 +6591,21 @@ def _project_relative_path_key(value: str) -> str:
     return str(value or "").replace("\\", "/").strip("/")
 
 
-def _unique_destination_path(directory: Path, file_name: str) -> Path:
+def _downscaled_count_suffix(downscaled_count: int) -> str:
+    return f" (уменьшено: {downscaled_count})" if downscaled_count else ""
+
+
+def _unique_destination_path(
+    directory: Path, file_name: str, *, reserved: set[Path] | None = None
+) -> Path:
     source_name = Path(file_name).name
     stem = Path(source_name).stem or "image"
     suffix = Path(source_name).suffix
     candidate = directory / source_name
     index = 1
-    while candidate.exists():
+    while candidate.exists() or (reserved is not None and candidate in reserved):
         candidate = directory / f"{stem}_{index}{suffix}"
         index += 1
+    if reserved is not None:
+        reserved.add(candidate)
     return candidate
