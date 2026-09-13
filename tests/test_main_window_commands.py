@@ -9,12 +9,12 @@ from PIL import Image
 from PyQt5.QtWidgets import QApplication, QDialog, QMessageBox, QRadioButton
 
 from magicborder import main_window as main_window_module
+from magicborder.image_crop import CropBox
 from magicborder.image_downscale import DOWNSCALE_PRESETS
 from magicborder.io_utils import load_project, save_project
 from magicborder.main_window import (
     ANALYSIS_OUTDATED_STATUS_TEXT,
     CONTOUR_ANALYSIS_OUTDATED_TEXT,
-    DOWNSCALE_CANCELLED,
     HISTOGRAM_DEFAULT_SIZES,
     HISTOGRAM_MANUAL_REFRESH_TEXT,
     IMAGE_PREPARE_CANCELLED_TEXT,
@@ -632,81 +632,33 @@ LARGE_SIZE = (2600, 1950)
 
 
 @pytest.fixture()
-def downscale_answers(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
-    """Подменяет диалог уменьшения больших изображений."""
-    record: dict[str, Any] = {"calls": [], "answer": FULL_HD}
-
-    def fake_ask(_self, large_images, total_count, *, overwrite):
-        record["calls"].append(
-            {"large": list(large_images), "total": total_count, "overwrite": overwrite}
-        )
-        return record["answer"]
-
-    monkeypatch.setattr(MainWindow, "_ask_large_image_downscale", fake_ask)
-    return record
+def no_extra_dialogs(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Фиксирует любые попытки показать диалог обрезки или уменьшения."""
+    shown: list[str] = []
+    monkeypatch.setattr(
+        MainWindow,
+        "_exec_crop_dialog",
+        lambda _self, record: shown.append(f"crop:{record.id}"),
+    )
+    monkeypatch.setattr(
+        MainWindow,
+        "_exec_downscale_dialog",
+        lambda _self, record, *_a, **_k: shown.append(f"downscale:{record.id}"),
+    )
+    return shown
 
 
 class TestAddLargeImagesToProject:
-    def test_small_images_do_not_ask(
+    def test_large_image_is_copied_in_original_resolution(
         self,
         project_window,
         dialogs: dict[str, Any],
-        downscale_answers: dict[str, Any],
-        tmp_path: Path,
-    ) -> None:
-        window = project_window()
-        source = _make_image(tmp_path / "источник" / "small.png", size=(1920, 1080))
-        dialogs["open_files"] = ([str(source)], "")
-
-        window.add_images_to_project()
-
-        assert downscale_answers["calls"] == []
-        assert window.project_document is not None
-        added = window.project_document.images[-1]
-        assert (added.image_width, added.image_height) == (1920, 1080)
-
-    def test_large_image_is_downscaled_copy(
-        self,
-        project_window,
-        dialogs: dict[str, Any],
-        downscale_answers: dict[str, Any],
+        no_extra_dialogs: list[str],
         tmp_path: Path,
     ) -> None:
         window = project_window()
         source = _make_image(tmp_path / "источник" / "big.png", size=LARGE_SIZE)
         dialogs["open_files"] = ([str(source)], "")
-        downscale_answers["answer"] = HD
-        assert window.project_path is not None
-
-        window.add_images_to_project()
-
-        assert downscale_answers["calls"] == [
-            {"large": [("big.png", LARGE_SIZE)], "total": 1, "overwrite": False}
-        ]
-        with Image.open(window.project_path.parent / "images" / "big.png") as image:
-            assert image.size == (960, 720)
-        with Image.open(source) as image:
-            assert image.size == LARGE_SIZE
-        assert window.project_document is not None
-        added = window.project_document.images[-1]
-        assert (added.image_width, added.image_height) == (960, 720)
-        assert window.statusBar().currentMessage() == (
-            "Добавлено изображений: 1 (уменьшено: 1)"
-        )
-        saved = load_project(window.project_path).images[-1]
-        assert (saved.image_width, saved.image_height) == (960, 720)
-
-    def test_keep_original_copies_file_as_is(
-        self,
-        project_window,
-        dialogs: dict[str, Any],
-        downscale_answers: dict[str, Any],
-        tmp_path: Path,
-    ) -> None:
-        window = project_window()
-        source = _make_image(tmp_path / "источник" / "big.png", size=LARGE_SIZE)
-        dialogs["open_files"] = ([str(source)], "")
-        downscale_answers["answer"] = None
         assert window.project_path is not None
 
         window.add_images_to_project()
@@ -716,35 +668,36 @@ class TestAddLargeImagesToProject:
         assert window.project_document is not None
         added = window.project_document.images[-1]
         assert (added.image_width, added.image_height) == LARGE_SIZE
+        assert added.crop_reviewed is False
+        assert window.canvas.image_size() == LARGE_SIZE
         assert window.statusBar().currentMessage() == "Добавлено изображений: 1"
+        assert no_extra_dialogs == []
+        saved = load_project(window.project_path).images[-1]
+        assert (saved.image_width, saved.image_height) == LARGE_SIZE
 
-    def test_cancel_adds_nothing(
+    def test_jpeg_is_copied_byte_for_byte(
         self,
         project_window,
         dialogs: dict[str, Any],
-        downscale_answers: dict[str, Any],
         tmp_path: Path,
     ) -> None:
         window = project_window()
-        small = _make_image(tmp_path / "источник" / "small.png")
-        big = _make_image(tmp_path / "источник" / "big.png", size=LARGE_SIZE)
-        dialogs["open_files"] = ([str(small), str(big)], "")
-        downscale_answers["answer"] = DOWNSCALE_CANCELLED
+        source = tmp_path / "источник" / "photo.jpg"
+        source.parent.mkdir(parents=True)
+        Image.effect_noise((4000, 3000), 40).convert("RGB").save(source, quality=97)
+        dialogs["open_files"] = ([str(source)], "")
         assert window.project_path is not None
-        project_before = window.project_path.read_text(encoding="utf-8")
 
         window.add_images_to_project()
 
-        assert window.project_document is not None
-        assert len(window.project_document.images) == 1
-        assert not (window.project_path.parent / "images" / "small.png").exists()
-        assert window.project_path.read_text(encoding="utf-8") == project_before
+        copied = window.project_path.parent / "images" / "photo.jpg"
+        assert copied.read_bytes() == source.read_bytes()
+        assert window.canvas.image_size() == (4000, 3000)
 
-    def test_mixed_batch_asks_once_and_keeps_order(
+    def test_mixed_batch_keeps_order_and_sizes(
         self,
         project_window,
         dialogs: dict[str, Any],
-        downscale_answers: dict[str, Any],
         tmp_path: Path,
     ) -> None:
         window = project_window()
@@ -760,17 +713,13 @@ class TestAddLargeImagesToProject:
 
         window.add_images_to_project()
 
-        assert len(downscale_answers["calls"]) == 1
-        call = downscale_answers["calls"][0]
-        assert call["total"] == 4
-        assert [label for label, _size in call["large"]] == ["a_big.png", "c_big.jpg"]
         assert window.project_document is not None
         added = window.project_document.images[1:]
         assert [record.display_name for record in added] == names
         assert [(record.image_width, record.image_height) for record in added] == [
-            (1440, 1080),
+            LARGE_SIZE,
             (30, 20),
-            (1440, 1080),
+            LARGE_SIZE,
             (30, 20),
         ]
 
@@ -778,7 +727,6 @@ class TestAddLargeImagesToProject:
         self,
         project_window,
         dialogs: dict[str, Any],
-        downscale_answers: dict[str, Any],  # noqa: ARG002
         tmp_path: Path,
     ) -> None:
         window = project_window()
@@ -795,7 +743,7 @@ class TestAddLargeImagesToProject:
         ] == ["images/photo.png", "images/photo_1.png"]
         image_dir = window.project_path.parent / "images"
         with Image.open(image_dir / "photo.png") as image:
-            assert image.size == (1440, 1080)
+            assert image.size == LARGE_SIZE
         with Image.open(image_dir / "photo_1.png") as image:
             assert image.size == (30, 20)
 
@@ -821,30 +769,22 @@ class TestAddLargeImagesToProject:
 
 
 class TestSyncLargeImages:
-    def _window_with_untracked_images(self, project_window) -> MainWindow:
-        window = project_window()
-        assert window.project_path is not None
-        image_dir = window.project_path.parent / "images"
-        _make_image(image_dir / "big.png", size=LARGE_SIZE)
-        _make_image(image_dir / "small.png", size=(30, 20))
-        return window
-
-    def test_sync_downscales_large_files_in_place(
+    def test_sync_keeps_files_in_original_resolution(
         self,
         project_window,
         dialogs: dict[str, Any],  # noqa: ARG002
-        downscale_answers: dict[str, Any],
+        no_extra_dialogs: list[str],
     ) -> None:
-        window = self._window_with_untracked_images(project_window)
+        window = project_window()
         assert window.project_path is not None
+        image_dir = window.project_path.parent / "images"
+        big = _make_image(image_dir / "big.png", size=LARGE_SIZE)
+        _make_image(image_dir / "small.png", size=(30, 20))
+        original_bytes = big.read_bytes()
 
         window.sync_project_images_folder()
 
-        assert downscale_answers["calls"] == [
-            {"large": [("images/big.png", LARGE_SIZE)], "total": 2, "overwrite": True}
-        ]
-        with Image.open(window.project_path.parent / "images" / "big.png") as image:
-            assert image.size == (1440, 1080)
+        assert big.read_bytes() == original_bytes
         records = {
             record.relative_path: record
             for record in load_project(window.project_path).images
@@ -852,50 +792,17 @@ class TestSyncLargeImages:
         assert (
             records["images/big.png"].image_width,
             records["images/big.png"].image_height,
-        ) == (1440, 1080)
+        ) == LARGE_SIZE
         assert (
             records["images/small.png"].image_width,
             records["images/small.png"].image_height,
         ) == (30, 20)
-        assert window.statusBar().currentMessage() == (
-            "Синхронизировано изображений: 2 (уменьшено: 1)"
-        )
-
-    def test_sync_keep_original_leaves_files(
-        self,
-        project_window,
-        dialogs: dict[str, Any],  # noqa: ARG002
-        downscale_answers: dict[str, Any],
-    ) -> None:
-        window = self._window_with_untracked_images(project_window)
-        downscale_answers["answer"] = None
-        assert window.project_path is not None
-        big = window.project_path.parent / "images" / "big.png"
-        original_bytes = big.read_bytes()
-
-        window.sync_project_images_folder()
-
-        assert big.read_bytes() == original_bytes
-        assert window.project_document is not None
-        assert len(window.project_document.images) == 3
-
-    def test_sync_cancel_adds_nothing(
-        self,
-        project_window,
-        dialogs: dict[str, Any],  # noqa: ARG002
-        downscale_answers: dict[str, Any],
-    ) -> None:
-        window = self._window_with_untracked_images(project_window)
-        downscale_answers["answer"] = DOWNSCALE_CANCELLED
-
-        window.sync_project_images_folder()
-
-        assert window.project_document is not None
-        assert len(window.project_document.images) == 1
+        assert window.statusBar().currentMessage() == "Синхронизировано изображений: 2"
+        assert no_extra_dialogs == []
 
 
-class TestLargeImageDownscaleDialog:
-    def _ask(self, window, monkeypatch, choose, **kwargs):
+class TestDownscaleDialog:
+    def _ask(self, window, monkeypatch, choose, size, *, cropped=True):
         shown: dict[str, Any] = {}
 
         def fake_exec(dialog) -> int:
@@ -909,42 +816,49 @@ class TestLargeImageDownscaleDialog:
             )
             if choose is None:
                 return QDialog.Rejected
-            buttons[choose].setChecked(True)
+            if choose != "default":
+                buttons[choose].setChecked(True)
             return QDialog.Accepted
 
         monkeypatch.setattr(main_window_module.QDialog, "exec_", fake_exec)
-        large = [(f"photo{index}.jpg", (6000, 4000)) for index in range(10)]
-        answer = window._ask_large_image_downscale(large, 12, **kwargs)
+        record = window._current_project_image()
+        answer = window._exec_downscale_dialog(record, size, cropped=cropped)
         return answer, shown
 
-    def test_default_is_svga(self, project_window, monkeypatch) -> None:
+    def test_default_keeps_original_resolution(
+        self, project_window, monkeypatch
+    ) -> None:
         window = project_window()
 
-        answer, shown = self._ask(window, monkeypatch, 2, overwrite=False)
+        answer, shown = self._ask(window, monkeypatch, "default", (6000, 4000))
+
+        assert answer is None
+        assert shown["checked"] == ["Оставить исходное разрешение (6000×4000)"]
+        assert shown["buttons"][1] == "1920×1080 (Full HD) → 1620×1080"
+        assert shown["buttons"][3] == "800×600 (SVGA) → 800×533 — рекомендуется"
+        assert "размер после обрезки — 6000×4000 px" in shown["text"]
+        assert "может быть медленной" in shown["text"]
+
+    def test_only_reducing_presets_are_offered(
+        self, project_window, monkeypatch
+    ) -> None:
+        window = project_window()
+
+        answer, shown = self._ask(window, monkeypatch, 1, (1000, 700), cropped=False)
 
         assert answer == SVGA
-        assert shown["checked"] == ["800×600 (SVGA) — рекомендуется"]
-        assert shown["buttons"][0] == "1920×1080 (Full HD)"
-        assert shown["buttons"][-1] == "Оставить оригинальное разрешение"
-        assert "10 из 12 изображений" in shown["text"]
-        assert "photo7.jpg — 6000×4000" in shown["text"]
-        assert "photo8.jpg" not in shown["text"]
-        assert "…и ещё 2" in shown["text"]
-        assert "перезаписаны" not in shown["text"]
+        assert shown["buttons"] == [
+            "Оставить исходное разрешение (1000×700)",
+            "800×600 (SVGA) → 800×560",
+            "600×450 → 600×420",
+        ]
+        assert "размер изображения — 1000×700 px" in shown["text"]
+        assert "медленной" not in shown["text"]
 
-    def test_choices_and_cancel(self, project_window, monkeypatch) -> None:
+    def test_closing_dialog_keeps_resolution(self, project_window, monkeypatch) -> None:
         window = project_window()
 
-        assert self._ask(window, monkeypatch, 1, overwrite=True)[0] == HD
-        answer, shown = self._ask(
-            window, monkeypatch, len(DOWNSCALE_PRESETS), overwrite=True
-        )
-        assert answer is None
-        assert "перезаписаны" in shown["text"]
-        assert (
-            self._ask(window, monkeypatch, None, overwrite=True)[0]
-            == DOWNSCALE_CANCELLED
-        )
+        assert self._ask(window, monkeypatch, None, (3000, 2000))[0] is None
 
 
 class TestImagePrepareWorker:
@@ -961,15 +875,34 @@ class TestImagePrepareWorker:
         worker.run()
         return emitted
 
-    def test_copy_and_downscale(self, qapp, tmp_path: Path) -> None:  # noqa: ARG002
+    def test_copy_keeps_resolution_and_crop_applies_preset(
+        self,
+        qapp,  # noqa: ARG002
+        tmp_path: Path,
+    ) -> None:
         source = _make_image(tmp_path / "big.png", size=LARGE_SIZE)
 
         assert self._run(ImagePrepareJob(source, tmp_path / "copy.png")) == [
-            (3, ImagePrepareResult(2600, 1950, downscaled=False))
+            (3, ImagePrepareResult(2600, 1950))
         ]
-        assert self._run(ImagePrepareJob(source, tmp_path / "small.png", HD)) == [
-            (3, ImagePrepareResult(960, 720, downscaled=True))
-        ]
+        assert (tmp_path / "copy.png").read_bytes() == source.read_bytes()
+        crop_job = ImagePrepareJob(
+            source, tmp_path / "small.png", crop=CropBox(0, 0, 2600, 1950), preset=HD
+        )
+        assert self._run(crop_job) == [(3, ImagePrepareResult(960, 720))]
+
+    def test_preset_without_crop_is_rejected(
+        self,
+        qapp,  # noqa: ARG002
+        tmp_path: Path,
+    ) -> None:
+        source = _make_image(tmp_path / "big.png", size=LARGE_SIZE)
+
+        emitted = self._run(ImagePrepareJob(source, source, preset=HD))
+
+        assert "только вместе с обрезкой" in emitted[0][1]
+        with Image.open(source) as image:
+            assert image.size == LARGE_SIZE
 
     def test_cancelled_job_is_skipped(self, qapp, tmp_path: Path) -> None:  # noqa: ARG002
         source = _make_image(tmp_path / "leaf.png")
@@ -1826,3 +1759,270 @@ def test_measurements_are_restored_from_project(project_window) -> None:
     window._load_project_image(window.project_document.images[0])
 
     assert window.canvas.has_angle_measurements() is True
+
+
+class TestCropImage:
+    @staticmethod
+    def _choose(monkeypatch: pytest.MonkeyPatch, crop_box, preset=None) -> list[tuple]:
+        calls: list[tuple] = []
+
+        def fake_crop(_self, record):
+            calls.append(("crop", record.id))
+            return crop_box
+
+        def fake_downscale(_self, record, size, *, cropped):
+            calls.append(("downscale", record.id, size, cropped))
+            return preset
+
+        monkeypatch.setattr(MainWindow, "_exec_crop_dialog", fake_crop)
+        monkeypatch.setattr(MainWindow, "_exec_downscale_dialog", fake_downscale)
+        return calls
+
+    def test_first_open_prompts_once_and_keep_as_is_is_persisted(
+        self, project_window, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        window = project_window()
+        calls = self._choose(monkeypatch, None)
+
+        window._maybe_prompt_crop("image-0")
+        window._maybe_prompt_crop("image-0")
+
+        assert calls == [("crop", "image-0")]
+        assert window.canvas.image_size() == (40, 30)
+        assert window._save_project_silently()
+        saved = json.loads(window.project_path.read_text(encoding="utf-8"))
+        assert saved["images"][0]["file"]["crop_reviewed"] is True
+        assert load_project(window.project_path).images[0].crop_reviewed is True
+
+    def test_prompt_is_skipped_for_other_or_reviewed_images(
+        self, project_window, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        window = project_window(image_names=("a.png", "b.png"))
+        calls = self._choose(monkeypatch, None)
+
+        window._maybe_prompt_crop("image-1")
+        window._current_project_image().crop_reviewed = True
+        window._maybe_prompt_crop("image-0")
+
+        assert calls == []
+
+    def test_load_schedules_prompt_only_for_unreviewed_images(
+        self, project_window, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        window = project_window(image_names=("a.png", "b.png"))
+        scheduled: list[str] = []
+        monkeypatch.setattr(
+            MainWindow,
+            "_schedule_crop_prompt",
+            lambda _self, record_id: scheduled.append(record_id),
+        )
+        window._project_image_by_id("image-1").crop_reviewed = True
+
+        window._select_project_image("image-1")
+        window._select_project_image("image-0")
+
+        assert scheduled == ["image-0"]
+
+    def test_crop_rewrites_file_and_moves_contour(
+        self, project_window, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        window = project_window()
+        window.canvas.set_contour(CONTOUR)
+        window._save_current_project_annotation()
+        calls = self._choose(monkeypatch, CropBox(4, 2, 24, 20))
+
+        assert window.crop_current_image() is True
+
+        # Область 24×20 меньше любого пресета: шаг уменьшения не показывается.
+        assert calls == [("crop", "image-0")]
+
+        record = window._current_project_image()
+        image_path = window._project_image_path(record)
+        with Image.open(image_path) as cropped:
+            assert cropped.size == (24, 20)
+        assert window.canvas.image_size() == (24, 20)
+        assert window.canvas.sceneRect().width() == 24
+        assert (record.image_width, record.image_height) == (24, 20)
+        assert record.crop_reviewed is True
+        assert window.canvas.contour_points() == [
+            Point(0, 2),
+            Point(24, 2),
+            Point(24, 20),
+            Point(0, 20),
+        ]
+        saved = load_project(window.project_path).images[0]
+        assert (saved.image_width, saved.image_height) == (24, 20)
+        assert saved.annotation is not None
+        assert (saved.annotation.image_width, saved.annotation.image_height) == (
+            24,
+            20,
+        )
+        assert saved.crop_reviewed is True
+        assert window.statusBar().currentMessage() == "Изображение обрезано: 24×20"
+
+    def test_crop_keeps_full_resolution_of_selected_area(
+        self, tmp_path: Path, project_window, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / "noise"
+        path = root / "images" / "photo.png"
+        path.parent.mkdir(parents=True)
+        original = Image.effect_noise((3000, 2000), 60).convert("RGB")
+        original.save(path)
+        record = ProjectImageRecord(
+            id="photo",
+            relative_path="images/photo.png",
+            display_name="photo.png",
+            image_width=3000,
+            image_height=2000,
+        )
+        window = project_window(records=[record], root=root)
+        self._choose(monkeypatch, CropBox(1000, 500, 1600, 1200))
+
+        assert window.crop_current_image() is True
+
+        assert window.canvas.image_size() == (1600, 1200)
+        with Image.open(path) as cropped:
+            assert cropped.tobytes() == original.crop((1000, 500, 2600, 1700)).tobytes()
+
+    def test_crop_with_preset_scales_measurements(
+        self, tmp_path: Path, project_window, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / "large"
+        _make_image(root / "images" / "big.png", size=(3000, 2000))
+        record = ProjectImageRecord(
+            id="big",
+            relative_path="images/big.png",
+            display_name="big.png",
+            image_width=3000,
+            image_height=2000,
+            measurements=ProjectImageMeasurements(
+                angles=[
+                    ProjectAngleMeasurement(
+                        id="angle",
+                        first=Point(1000, 1000),
+                        vertex=Point(2000, 1500),
+                        second=Point(2800, 1000),
+                    )
+                ]
+            ),
+        )
+        window = project_window(records=[record], root=root)
+        calls = self._choose(monkeypatch, CropBox(0, 0, 3000, 2000), SVGA)
+
+        assert window.crop_current_image() is True
+
+        assert calls[-1] == ("downscale", "big", (3000, 2000), False)
+        assert window.statusBar().currentMessage() == (
+            "Разрешение изображения понижено: 800×533"
+        )
+
+        current = window._current_project_image()
+        assert window.canvas.image_size() == (800, 533)
+        assert current.measurements.angles[0].vertex.x == pytest.approx(533.333, 1e-3)
+        assert current.measurements.angles[0].vertex.y == pytest.approx(399.75, 1e-3)
+
+    def test_noop_crop_only_marks_image_reviewed(
+        self, project_window, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        window = project_window()
+        image_path = window._project_image_path(window._current_project_image())
+        mtime = image_path.stat().st_mtime_ns
+        calls = self._choose(monkeypatch, CropBox(0, 0, 40, 30))
+
+        assert window.crop_current_image() is False
+
+        # 40×30 меньше любого пресета: шаг уменьшения не показывается.
+        assert calls == [("crop", "image-0")]
+        assert image_path.stat().st_mtime_ns == mtime
+        assert window._current_project_image().crop_reviewed is True
+
+    def test_keep_as_is_still_offers_downscale(
+        self, tmp_path: Path, project_window, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / "large"
+        path = _make_image(root / "images" / "big.png", size=LARGE_SIZE)
+        record = ProjectImageRecord(
+            id="big", relative_path="images/big.png", display_name="big.png"
+        )
+        window = project_window(records=[record], root=root)
+        calls = self._choose(monkeypatch, None, SVGA)
+
+        assert window.crop_current_image() is True
+
+        assert calls == [("crop", "big"), ("downscale", "big", LARGE_SIZE, False)]
+        with Image.open(path) as result:
+            assert result.size == (800, 600)
+        assert window.canvas.image_size() == (800, 600)
+        assert window._current_project_image().crop_reviewed is True
+        assert window.statusBar().currentMessage() == (
+            "Разрешение изображения понижено: 800×600"
+        )
+
+    def test_keep_as_is_and_keep_resolution_leave_file_untouched(
+        self, tmp_path: Path, project_window, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / "large"
+        path = _make_image(root / "images" / "big.png", size=LARGE_SIZE)
+        original_bytes = path.read_bytes()
+        record = ProjectImageRecord(
+            id="big", relative_path="images/big.png", display_name="big.png"
+        )
+        window = project_window(records=[record], root=root)
+        calls = self._choose(monkeypatch, None, None)
+
+        assert window.crop_current_image() is False
+
+        assert calls == [("crop", "big"), ("downscale", "big", LARGE_SIZE, False)]
+        assert path.read_bytes() == original_bytes
+        assert window.canvas.image_size() == LARGE_SIZE
+        assert window._current_project_image().crop_reviewed is True
+
+    def test_crop_and_downscale_are_saved_in_one_step(
+        self, tmp_path: Path, project_window, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = tmp_path / "large"
+        path = _make_image(root / "images" / "big.png", size=(4000, 3000))
+        record = ProjectImageRecord(
+            id="big", relative_path="images/big.png", display_name="big.png"
+        )
+        window = project_window(records=[record], root=root)
+        saved_jobs: list = []
+        original_run = MainWindow._run_image_prepare_jobs
+
+        def spy(self, jobs, **kwargs):
+            saved_jobs.extend(jobs)
+            return original_run(self, jobs, **kwargs)
+
+        monkeypatch.setattr(MainWindow, "_run_image_prepare_jobs", spy)
+        calls = self._choose(monkeypatch, CropBox(0, 0, 3200, 2400), SVGA)
+
+        assert window.crop_current_image() is True
+
+        assert calls[-1] == ("downscale", "big", (3200, 2400), True)
+        assert len(saved_jobs) == 1
+        assert saved_jobs[0].crop == CropBox(0, 0, 3200, 2400)
+        assert saved_jobs[0].preset == SVGA
+        with Image.open(path) as result:
+            assert result.size == (800, 600)
+        assert window.statusBar().currentMessage() == (
+            "Изображение обрезано и уменьшено: 800×600"
+        )
+
+    def test_manual_crop_opens_dialog_for_reviewed_image(
+        self, project_window, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        window = project_window()
+        window._current_project_image().crop_reviewed = True
+        calls = self._choose(monkeypatch, None)
+
+        window.crop_image_action.trigger()
+
+        assert calls == [("crop", "image-0")]
+
+    def test_crop_action_requires_open_image(self, project_window) -> None:
+        window = project_window()
+        window._update_action_states()
+        assert window.crop_image_action.isEnabled()
+
+        window._clear_current_image_display()
+        assert not window.crop_image_action.isEnabled()

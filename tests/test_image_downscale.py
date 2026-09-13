@@ -5,19 +5,27 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+from magicborder.image_crop import crop_image_file, full_crop_box
 from magicborder.image_downscale import (
     DOWNSCALE_PRESETS,
     DownscalePreset,
-    downscale_image_file,
     fit_size,
     is_large_image,
     read_image_header,
     read_image_size,
+    reducing_presets,
     verify_raster_image,
 )
 from magicborder.io_utils import read_image_captured_at
 
 FULL_HD, HD, SVGA, SMALL = DOWNSCALE_PRESETS
+
+
+def downscale_image_file(source: Path, destination: Path, preset: DownscalePreset):
+    """Понижение разрешения без обрезки: рамка на весь кадр плюс пресет."""
+    with Image.open(source) as image:
+        size = image.size
+    return crop_image_file(source, destination, full_crop_box(size), preset)
 
 
 class TestSizeRules:
@@ -59,6 +67,16 @@ class TestSizeRules:
         expected: tuple[int, int],
     ) -> None:
         assert fit_size(size, preset) == expected
+
+    def test_reducing_presets_skip_ones_that_do_not_shrink(self) -> None:
+        assert reducing_presets((1000, 700)) == [
+            (SVGA, (800, 560)),
+            (SMALL, (600, 420)),
+        ]
+        assert reducing_presets((600, 450)) == []
+        assert [preset for preset, _size in reducing_presets((4000, 3000))] == list(
+            DOWNSCALE_PRESETS
+        )
 
     def test_fit_size_rejects_empty_size(self) -> None:
         with pytest.raises(ValueError):
@@ -118,7 +136,7 @@ class TestReadAndVerify:
             verify_raster_image(path)
 
 
-class TestDownscaleImageFile:
+class TestDownscaleWithoutCrop:
     def test_png_is_resized_with_same_colors(self, tmp_path: Path) -> None:
         source = tmp_path / "big.png"
         Image.new("RGB", (3000, 2000), (120, 80, 40)).save(source)
@@ -202,4 +220,6 @@ class TestDownscaleImageFile:
         source.write_bytes(b"not an image")
 
         with pytest.raises(ValueError, match="Не удалось распознать"):
-            downscale_image_file(source, tmp_path / "out.jpg", FULL_HD)
+            crop_image_file(
+                source, tmp_path / "out.jpg", full_crop_box((10, 10)), FULL_HD
+            )

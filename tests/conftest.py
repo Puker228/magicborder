@@ -26,6 +26,17 @@ from magicborder.io_utils import (  # noqa: E402
 from magicborder.models import ProjectDocument, ProjectImageRecord  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _no_automatic_crop_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Автопоказ модального диалога обрезки заблокировал бы тесты.
+
+    Тесты автопоказа вызывают MainWindow._maybe_prompt_crop напрямую.
+    """
+    from magicborder.main_window import MainWindow
+
+    monkeypatch.setattr(MainWindow, "_schedule_crop_prompt", lambda *_args: None)
+
+
 @pytest.fixture(scope="session")
 def qapp() -> Iterator[QApplication]:
     """Единственный QApplication на весь прогон тестов."""
