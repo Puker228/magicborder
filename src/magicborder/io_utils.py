@@ -6,6 +6,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 # saxutils.escape/quoteattr only escape output, they do not parse XML.
 from xml.sax.saxutils import escape, quoteattr  # nosec B406
@@ -17,6 +18,8 @@ from PyQt5.QtGui import QImage, QPixmap
 from .models import Annotation, ProjectDocument
 
 SUPPORTED_RASTER_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+PNG_FAST_COMPRESS_LEVEL = 1
+JPEG_SAVE_QUALITY = 95
 
 
 @dataclass(slots=True)
@@ -35,15 +38,13 @@ def image_open_filter() -> str:
 
 
 def load_raster_image(path: str | Path) -> LoadedImage:
-    image_path = Path(path)
-    if not image_path.exists():
-        raise FileNotFoundError(f"Файл не найден: {image_path}")
-    if image_path.suffix.lower() not in SUPPORTED_RASTER_SUFFIXES:
-        raise ValueError("Неподдерживаемый формат изображения.")
-
+    image_path = _checked_raster_path(path)
     try:
         with Image.open(image_path) as pil_image:
-            rgba_image = pil_image.convert("RGBA")
+            # Альфа нужна только для отображения прозрачных PNG/TIFF. У обычных
+            # фотографий её нет, и промежуточный RGBA-кадр (+33% памяти и ещё
+            # одна конверсия) не создаётся.
+            rgba_image = pil_image.convert("RGBA") if _has_alpha(pil_image) else None
             rgb_image = pil_image.convert("RGB")
     except UnidentifiedImageError as exc:
         raise ValueError(
@@ -52,8 +53,61 @@ def load_raster_image(path: str | Path) -> LoadedImage:
     except OSError as exc:
         raise ValueError(f"Не удалось открыть изображение: {exc}") from exc
 
-    rgb_array = np.array(rgb_image, dtype=np.uint8)
-    return loaded_image_from_rgb_array(image_path, rgb_array, rgba_image=rgba_image)
+    # np.asarray забирает буфер PIL без второй копии; массив свежий, и больше
+    # на него никто не ссылается, поэтому защитная копия не нужна.
+    rgb_array = np.asarray(rgb_image, dtype=np.uint8)
+    return loaded_image_from_rgb_array(
+        image_path, rgb_array, rgba_image=rgba_image, copy=False
+    )
+
+
+def load_rgb_array(path: str | Path) -> np.ndarray:
+    """Декодирует только RGB-массив, без QImage/QPixmap.
+
+    QPixmap можно создавать только в GUI-потоке, а для статистики он не нужен,
+    поэтому эту функцию безопасно вызывать из рабочих потоков.
+    """
+    image_path = _checked_raster_path(path)
+    try:
+        with Image.open(image_path) as pil_image:
+            rgb_image = (
+                pil_image if pil_image.mode == "RGB" else pil_image.convert("RGB")
+            )
+            rgb_image.load()
+            return np.asarray(rgb_image, dtype=np.uint8)
+    except UnidentifiedImageError as exc:
+        raise ValueError(
+            "Не удалось распознать файл как растровое изображение."
+        ) from exc
+    except OSError as exc:
+        raise ValueError(f"Не удалось открыть изображение: {exc}") from exc
+
+
+def save_rgb_array_atomically(rgb_array: np.ndarray, image_path: str | Path) -> None:
+    """Сохраняет RGB-массив через временный файл, чтобы не испортить исходник при сбое."""
+    target_path = Path(image_path)
+    temp_path = target_path.with_name(
+        f".{target_path.stem}.magicborder-{uuid4().hex}{target_path.suffix}"
+    )
+    save_kwargs: dict[str, object] = {}
+    suffix = target_path.suffix.lower()
+    if suffix == ".png":
+        # Сжатие PNG без потерь на любом уровне; уровень 1 кодирует кадр
+        # 1920×1080 в разы быстрее уровня 6 по умолчанию, файл чуть больше.
+        save_kwargs["compress_level"] = PNG_FAST_COMPRESS_LEVEL
+    elif suffix in (".jpg", ".jpeg"):
+        save_kwargs["quality"] = JPEG_SAVE_QUALITY
+    try:
+        Image.fromarray(np.asarray(rgb_array, dtype=np.uint8), mode="RGB").save(
+            temp_path, **save_kwargs
+        )
+        temp_path.replace(target_path)
+    except (OSError, ValueError):
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def save_annotation(path: str | Path, annotation: Annotation) -> None:
@@ -137,7 +191,10 @@ def read_image_captured_at(path: str | Path) -> str:
             exif = image.getexif()
     except (OSError, UnidentifiedImageError):
         return ""
+    return captured_at_from_exif(exif)
 
+
+def captured_at_from_exif(exif: Image.Exif | None) -> str:
     if not exif:
         return ""
 
@@ -155,14 +212,15 @@ def loaded_image_from_rgb_array(
     rgb_array: np.ndarray,
     *,
     rgba_image: Image.Image | None = None,
+    copy: bool = True,
 ) -> LoadedImage:
     image_path = Path(path).resolve()
-    normalized_rgb = _normalize_rgb_array(rgb_array)
+    normalized_rgb = _normalize_rgb_array(rgb_array, copy=copy)
 
-    if rgba_image is None:
-        rgba_image = Image.fromarray(normalized_rgb, mode="RGB").convert("RGBA")
-
-    qimage = _pil_rgba_to_qimage(rgba_image)
+    if rgba_image is not None:
+        qimage = _pil_rgba_to_qimage(rgba_image)
+    else:
+        qimage = _rgb_array_to_qimage(normalized_rgb)
     pixmap = QPixmap.fromImage(qimage)
 
     return LoadedImage(
@@ -173,6 +231,14 @@ def loaded_image_from_rgb_array(
         width=qimage.width(),
         height=qimage.height(),
     )
+
+
+def _rgb_array_to_qimage(rgb_array: np.ndarray) -> QImage:
+    height, width = rgb_array.shape[:2]
+    # QImage поверх буфера numpy (без tobytes и без RGBA-кадра). copy() делает
+    # QImage владельцем данных, иначе он ссылался бы на память массива.
+    qimage = QImage(rgb_array.data, width, height, 3 * width, QImage.Format_RGB888)
+    return qimage.copy()
 
 
 def _pil_rgba_to_qimage(image: Image.Image) -> QImage:
@@ -457,10 +523,31 @@ def _parse_exif_datetime(value: object) -> str:
     return raw_text
 
 
-def _normalize_rgb_array(rgb_array: np.ndarray) -> np.ndarray:
-    array = np.ascontiguousarray(rgb_array)
-    if array.ndim != 3 or array.shape[2] != 3:
+def _normalize_rgb_array(rgb_array: np.ndarray, *, copy: bool = True) -> np.ndarray:
+    source = np.asarray(rgb_array)
+    if source.ndim != 3 or source.shape[2] != 3:
         raise ValueError("Ожидается RGB-массив изображения с тремя каналами.")
-    if array.dtype != np.uint8:
-        array = array.astype(np.uint8)
-    return array.copy()
+    # ascontiguousarray копирует только при другом dtype или разрывной памяти.
+    array = np.ascontiguousarray(source, dtype=np.uint8)
+    # Защитная копия нужна, только если буфер общий с массивом вызывающего кода.
+    if copy and np.shares_memory(array, source):
+        array = array.copy()
+    # Массив только для чтения: его можно отдавать в рабочие потоки без копий,
+    # не опасаясь, что кто-то изменит пиксели во время расчёта.
+    array.flags.writeable = False
+    return array
+
+
+def _has_alpha(image: Image.Image) -> bool:
+    return image.mode in ("RGBA", "LA", "PA", "RGBa", "La") or (
+        "transparency" in image.info
+    )
+
+
+def _checked_raster_path(path: str | Path) -> Path:
+    image_path = Path(path)
+    if not image_path.exists():
+        raise FileNotFoundError(f"Файл не найден: {image_path}")
+    if image_path.suffix.lower() not in SUPPORTED_RASTER_SUFFIXES:
+        raise ValueError("Неподдерживаемый формат изображения.")
+    return image_path

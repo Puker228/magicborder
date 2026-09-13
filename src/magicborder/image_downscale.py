@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from PIL import Image, UnidentifiedImageError
 
-from .io_utils import SUPPORTED_RASTER_SUFFIXES
+from .io_utils import SUPPORTED_RASTER_SUFFIXES, captured_at_from_exif
 
 LARGE_IMAGE_THRESHOLD = (2560, 1920)
 JPEG_SUFFIXES = (".jpg", ".jpeg")
@@ -34,6 +34,20 @@ def read_image_size(path: str | Path) -> tuple[int, int]:
     try:
         with Image.open(image_path) as image:
             return image.size
+    except UnidentifiedImageError as exc:
+        raise ValueError(
+            "Не удалось распознать файл как растровое изображение."
+        ) from exc
+    except OSError as exc:
+        raise ValueError(f"Не удалось открыть изображение: {exc}") from exc
+
+
+def read_image_header(path: str | Path) -> tuple[tuple[int, int], str]:
+    """Размер и дата съёмки за одно открытие файла (раньше файл открывался дважды)."""
+    image_path = _checked_raster_path(path)
+    try:
+        with Image.open(image_path) as image:
+            return image.size, captured_at_from_exif(image.getexif())
     except UnidentifiedImageError as exc:
         raise ValueError(
             "Не удалось распознать файл как растровое изображение."

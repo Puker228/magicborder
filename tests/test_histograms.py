@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 from PyQt5.QtGui import QColor
@@ -227,6 +228,58 @@ class TestNormalizeLmsForDisplay:
         for item in data.series:
             assert item.values[255] == 1
             assert item.values[0] == 1
+
+
+def _reference_histogram_values(name: str, pixels: np.ndarray) -> list[np.ndarray]:
+    """Прежняя попиксельная реализация гистограмм — эталон для оптимизированной."""
+    column = pixels.reshape((-1, 1, 3))
+    if name == "rgb":
+        return [np.bincount(pixels[:, c], minlength=256)[:256] for c in range(3)]
+    if name == "lab":
+        lab = cv2.cvtColor(column, cv2.COLOR_RGB2LAB).reshape((-1, 3))
+        lab = lab.astype(np.float32)
+        return [
+            np.histogram(lab[:, 0] * (100.0 / 255.0), bins=256, range=(0.0, 100.0))[0],
+            np.histogram(lab[:, 1] - 128.0, bins=256, range=(-128.0, 128.0))[0],
+            np.histogram(lab[:, 2] - 128.0, bins=256, range=(-128.0, 128.0))[0],
+        ]
+    if name == "hsv":
+        hsv = cv2.cvtColor(column, cv2.COLOR_RGB2HSV).reshape((-1, 3))
+        hue = np.rint(hsv[:, 0].astype(np.float32) * (255.0 / 179.0))
+        hue = np.clip(hue, 0, 255).astype(np.uint8)
+        return [
+            np.bincount(hue, minlength=256)[:256],
+            np.bincount(hsv[:, 1], minlength=256)[:256],
+            np.bincount(hsv[:, 2], minlength=256)[:256],
+        ]
+    yuv = cv2.cvtColor(column, cv2.COLOR_RGB2YUV).reshape((-1, 3))
+    return [np.bincount(yuv[:, c], minlength=256)[:256] for c in range(3)]
+
+
+def _every_rgb_color() -> np.ndarray:
+    channels = np.meshgrid(*(np.arange(256, dtype=np.uint8),) * 3, indexing="ij")
+    return np.stack(channels, axis=-1).reshape((-1, 3))
+
+
+class TestOptimizedHistogramsMatchReference:
+    @pytest.mark.parametrize("name", ["rgb", "lab", "hsv", "yuv"])
+    def test_counts_match_per_pixel_reference_for_every_color(self, name: str) -> None:
+        pixels = _every_rgb_color()
+        builder = getattr(histograms, f"build_{name}_histogram")
+
+        data = builder(pixels)
+
+        assert data is not None
+        for series, expected in zip(
+            data.series, _reference_histogram_values(name, pixels), strict=True
+        ):
+            assert np.array_equal(series.values, expected)
+
+    def test_lut_lms_matches_float_formula_for_every_color(self) -> None:
+        pixels = _every_rgb_color()
+
+        # float-вход идёт по прежнему пути с pow, uint8 — через таблицу.
+        assert np.array_equal(rgb_to_lms(pixels), rgb_to_lms(pixels.astype(np.float32)))
 
 
 class TestShortCount:

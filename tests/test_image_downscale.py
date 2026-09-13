@@ -11,6 +11,7 @@ from magicborder.image_downscale import (
     downscale_image_file,
     fit_size,
     is_large_image,
+    read_image_header,
     read_image_size,
     verify_raster_image,
 )
@@ -61,6 +62,21 @@ class TestSizeRules:
 
 
 class TestReadAndVerify:
+    def test_read_image_header_returns_size_and_capture_date(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "photo.jpg"
+        exif = Image.Exif()
+        exif[36867] = "2021:01:02 03:04:05"
+        Image.new("RGB", (30, 20)).save(path, exif=exif)
+        plain = tmp_path / "plain.png"
+        Image.new("RGB", (7, 5)).save(plain)
+
+        assert read_image_header(path) == ((30, 20), "2021-01-02T03:04:05")
+        assert read_image_header(plain) == ((7, 5), "")
+        with pytest.raises(FileNotFoundError):
+            read_image_header(tmp_path / "нет.png")
+
     def test_read_image_size_reads_header(self, tmp_path: Path) -> None:
         path = tmp_path / "leaf.png"
         Image.new("RGB", (30, 20)).save(path)
