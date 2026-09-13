@@ -25,7 +25,10 @@ class DownscalePreset:
 DOWNSCALE_PRESETS: tuple[DownscalePreset, ...] = (
     DownscalePreset("1920×1080 (Full HD)", 1920, 1080),
     DownscalePreset("1280×720 (HD)", 1280, 720),
+    DownscalePreset("800×600 (SVGA)", 800, 600),
+    DownscalePreset("600×450", 600, 450),
 )
+RECOMMENDED_PRESET_INDEX = 2
 
 
 def read_image_size(path: str | Path) -> tuple[int, int]:

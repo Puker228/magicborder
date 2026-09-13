@@ -627,7 +627,7 @@ class TestAddImagesToProject:
         assert len(window.project_document.images) == 1
 
 
-FULL_HD, HD = DOWNSCALE_PRESETS
+FULL_HD, HD, SVGA, _ = DOWNSCALE_PRESETS
 LARGE_SIZE = (2600, 1950)
 
 
@@ -917,13 +917,14 @@ class TestLargeImageDownscaleDialog:
         answer = window._ask_large_image_downscale(large, 12, **kwargs)
         return answer, shown
 
-    def test_default_is_full_hd(self, project_window, monkeypatch) -> None:
+    def test_default_is_svga(self, project_window, monkeypatch) -> None:
         window = project_window()
 
-        answer, shown = self._ask(window, monkeypatch, 0, overwrite=False)
+        answer, shown = self._ask(window, monkeypatch, 2, overwrite=False)
 
-        assert answer == FULL_HD
-        assert shown["checked"] == ["1920×1080 (Full HD) — рекомендуется"]
+        assert answer == SVGA
+        assert shown["checked"] == ["800×600 (SVGA) — рекомендуется"]
+        assert shown["buttons"][0] == "1920×1080 (Full HD)"
         assert shown["buttons"][-1] == "Оставить оригинальное разрешение"
         assert "10 из 12 изображений" in shown["text"]
         assert "photo7.jpg — 6000×4000" in shown["text"]
@@ -935,7 +936,9 @@ class TestLargeImageDownscaleDialog:
         window = project_window()
 
         assert self._ask(window, monkeypatch, 1, overwrite=True)[0] == HD
-        answer, shown = self._ask(window, monkeypatch, 2, overwrite=True)
+        answer, shown = self._ask(
+            window, monkeypatch, len(DOWNSCALE_PRESETS), overwrite=True
+        )
         assert answer is None
         assert "перезаписаны" in shown["text"]
         assert (

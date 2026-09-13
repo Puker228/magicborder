@@ -82,6 +82,7 @@ from .icons import ACTION_VISUALS, TOOLBAR_ICON_SIZE, apply_action_visual, load_
 from .image_downscale import (
     DOWNSCALE_PRESETS,
     LARGE_IMAGE_THRESHOLD,
+    RECOMMENDED_PRESET_INDEX,
     DownscalePreset,
     downscale_image_file,
     fit_size,
@@ -3122,7 +3123,9 @@ class MainWindow(QMainWindow):
         example_label, example_size = large_images[0]
         preset_buttons: list[tuple[QRadioButton, DownscalePreset | None]] = []
         for index, preset in enumerate(DOWNSCALE_PRESETS):
-            text = preset.label + (" — рекомендуется" if index == 0 else "")
+            text = preset.label + (
+                " — рекомендуется" if index == RECOMMENDED_PRESET_INDEX else ""
+            )
             button = QRadioButton(text, dialog)
             target_width, target_height = fit_size(example_size, preset)
             button.setToolTip(
@@ -3132,7 +3135,7 @@ class MainWindow(QMainWindow):
             preset_buttons.append((button, preset))
         original_button = QRadioButton("Оставить оригинальное разрешение", dialog)
         preset_buttons.append((original_button, None))
-        preset_buttons[0][0].setChecked(True)
+        preset_buttons[RECOMMENDED_PRESET_INDEX][0].setChecked(True)
 
         button_box = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dialog

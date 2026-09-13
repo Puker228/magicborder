@@ -17,7 +17,7 @@ from magicborder.image_downscale import (
 )
 from magicborder.io_utils import read_image_captured_at
 
-FULL_HD, HD = DOWNSCALE_PRESETS
+FULL_HD, HD, SVGA, SMALL = DOWNSCALE_PRESETS
 
 
 class TestSizeRules:
@@ -46,6 +46,10 @@ class TestSizeRules:
             ((2560, 1920), FULL_HD, (1440, 1080)),
             ((800, 600), FULL_HD, (800, 600)),
             ((10000, 10), HD, (1280, 1)),
+            ((3840, 2160), SVGA, (800, 450)),
+            ((4000, 6000), SVGA, (533, 800)),
+            ((6000, 4000), SMALL, (600, 400)),
+            ((800, 600), SMALL, (600, 450)),
         ],
     )
     def test_fit_size_keeps_aspect_ratio_without_upscaling(
