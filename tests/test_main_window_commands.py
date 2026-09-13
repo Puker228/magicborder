@@ -6,17 +6,23 @@ from typing import Any
 
 import pytest
 from PIL import Image
-from PyQt5.QtWidgets import QApplication, QMessageBox
+from PyQt5.QtWidgets import QApplication, QDialog, QMessageBox, QRadioButton
 
 from magicborder import main_window as main_window_module
+from magicborder.image_downscale import DOWNSCALE_PRESETS
 from magicborder.io_utils import load_project, save_project
 from magicborder.main_window import (
     ANALYSIS_OUTDATED_STATUS_TEXT,
     CONTOUR_ANALYSIS_OUTDATED_TEXT,
+    DOWNSCALE_CANCELLED,
     HISTOGRAM_DEFAULT_SIZES,
     HISTOGRAM_MANUAL_REFRESH_TEXT,
+    IMAGE_PREPARE_CANCELLED_TEXT,
     WORKSPACE_DEFAULT_SIZES,
+    ImagePrepareJob,
+    ImagePrepareResult,
     MainWindow,
+    _ImagePrepareWorker,
     _unique_destination_path,
 )
 from magicborder.models import (
@@ -621,7 +627,377 @@ class TestAddImagesToProject:
         assert len(window.project_document.images) == 1
 
 
+FULL_HD, HD = DOWNSCALE_PRESETS
+LARGE_SIZE = (2600, 1950)
+
+
+@pytest.fixture()
+def downscale_answers(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Подменяет диалог уменьшения больших изображений."""
+    record: dict[str, Any] = {"calls": [], "answer": FULL_HD}
+
+    def fake_ask(_self, large_images, total_count, *, overwrite):
+        record["calls"].append(
+            {"large": list(large_images), "total": total_count, "overwrite": overwrite}
+        )
+        return record["answer"]
+
+    monkeypatch.setattr(MainWindow, "_ask_large_image_downscale", fake_ask)
+    return record
+
+
+class TestAddLargeImagesToProject:
+    def test_small_images_do_not_ask(
+        self,
+        project_window,
+        dialogs: dict[str, Any],
+        downscale_answers: dict[str, Any],
+        tmp_path: Path,
+    ) -> None:
+        window = project_window()
+        source = _make_image(tmp_path / "источник" / "small.png", size=(1920, 1080))
+        dialogs["open_files"] = ([str(source)], "")
+
+        window.add_images_to_project()
+
+        assert downscale_answers["calls"] == []
+        assert window.project_document is not None
+        added = window.project_document.images[-1]
+        assert (added.image_width, added.image_height) == (1920, 1080)
+
+    def test_large_image_is_downscaled_copy(
+        self,
+        project_window,
+        dialogs: dict[str, Any],
+        downscale_answers: dict[str, Any],
+        tmp_path: Path,
+    ) -> None:
+        window = project_window()
+        source = _make_image(tmp_path / "источник" / "big.png", size=LARGE_SIZE)
+        dialogs["open_files"] = ([str(source)], "")
+        downscale_answers["answer"] = HD
+        assert window.project_path is not None
+
+        window.add_images_to_project()
+
+        assert downscale_answers["calls"] == [
+            {"large": [("big.png", LARGE_SIZE)], "total": 1, "overwrite": False}
+        ]
+        with Image.open(window.project_path.parent / "images" / "big.png") as image:
+            assert image.size == (960, 720)
+        with Image.open(source) as image:
+            assert image.size == LARGE_SIZE
+        assert window.project_document is not None
+        added = window.project_document.images[-1]
+        assert (added.image_width, added.image_height) == (960, 720)
+        assert window.statusBar().currentMessage() == (
+            "Добавлено изображений: 1 (уменьшено: 1)"
+        )
+        saved = load_project(window.project_path).images[-1]
+        assert (saved.image_width, saved.image_height) == (960, 720)
+
+    def test_keep_original_copies_file_as_is(
+        self,
+        project_window,
+        dialogs: dict[str, Any],
+        downscale_answers: dict[str, Any],
+        tmp_path: Path,
+    ) -> None:
+        window = project_window()
+        source = _make_image(tmp_path / "источник" / "big.png", size=LARGE_SIZE)
+        dialogs["open_files"] = ([str(source)], "")
+        downscale_answers["answer"] = None
+        assert window.project_path is not None
+
+        window.add_images_to_project()
+
+        copied = window.project_path.parent / "images" / "big.png"
+        assert copied.read_bytes() == source.read_bytes()
+        assert window.project_document is not None
+        added = window.project_document.images[-1]
+        assert (added.image_width, added.image_height) == LARGE_SIZE
+        assert window.statusBar().currentMessage() == "Добавлено изображений: 1"
+
+    def test_cancel_adds_nothing(
+        self,
+        project_window,
+        dialogs: dict[str, Any],
+        downscale_answers: dict[str, Any],
+        tmp_path: Path,
+    ) -> None:
+        window = project_window()
+        small = _make_image(tmp_path / "источник" / "small.png")
+        big = _make_image(tmp_path / "источник" / "big.png", size=LARGE_SIZE)
+        dialogs["open_files"] = ([str(small), str(big)], "")
+        downscale_answers["answer"] = DOWNSCALE_CANCELLED
+        assert window.project_path is not None
+        project_before = window.project_path.read_text(encoding="utf-8")
+
+        window.add_images_to_project()
+
+        assert window.project_document is not None
+        assert len(window.project_document.images) == 1
+        assert not (window.project_path.parent / "images" / "small.png").exists()
+        assert window.project_path.read_text(encoding="utf-8") == project_before
+
+    def test_mixed_batch_asks_once_and_keeps_order(
+        self,
+        project_window,
+        dialogs: dict[str, Any],
+        downscale_answers: dict[str, Any],
+        tmp_path: Path,
+    ) -> None:
+        window = project_window()
+        names = ["a_big.png", "b_small.png", "c_big.jpg", "d_small.png"]
+        sources = [
+            _make_image(
+                tmp_path / "источник" / name,
+                size=LARGE_SIZE if "big" in name else (30, 20),
+            )
+            for name in names
+        ]
+        dialogs["open_files"] = ([str(source) for source in sources], "")
+
+        window.add_images_to_project()
+
+        assert len(downscale_answers["calls"]) == 1
+        call = downscale_answers["calls"][0]
+        assert call["total"] == 4
+        assert [label for label, _size in call["large"]] == ["a_big.png", "c_big.jpg"]
+        assert window.project_document is not None
+        added = window.project_document.images[1:]
+        assert [record.display_name for record in added] == names
+        assert [(record.image_width, record.image_height) for record in added] == [
+            (1440, 1080),
+            (30, 20),
+            (1440, 1080),
+            (30, 20),
+        ]
+
+    def test_same_names_from_different_folders_do_not_collide(
+        self,
+        project_window,
+        dialogs: dict[str, Any],
+        downscale_answers: dict[str, Any],  # noqa: ARG002
+        tmp_path: Path,
+    ) -> None:
+        window = project_window()
+        first = _make_image(tmp_path / "one" / "photo.png", size=LARGE_SIZE)
+        second = _make_image(tmp_path / "two" / "photo.png", size=(30, 20))
+        dialogs["open_files"] = ([str(first), str(second)], "")
+        assert window.project_path is not None
+
+        window.add_images_to_project()
+
+        assert window.project_document is not None
+        assert [
+            record.relative_path for record in window.project_document.images[1:]
+        ] == ["images/photo.png", "images/photo_1.png"]
+        image_dir = window.project_path.parent / "images"
+        with Image.open(image_dir / "photo.png") as image:
+            assert image.size == (1440, 1080)
+        with Image.open(image_dir / "photo_1.png") as image:
+            assert image.size == (30, 20)
+
+    def test_truncated_file_is_reported(
+        self,
+        project_window,
+        dialogs: dict[str, Any],
+        tmp_path: Path,
+    ) -> None:
+        window = project_window()
+        broken = tmp_path / "источник" / "broken.png"
+        broken.parent.mkdir(parents=True)
+        Image.effect_noise((64, 64), 50).convert("RGB").save(broken)
+        broken.write_bytes(broken.read_bytes()[:200])
+        dialogs["open_files"] = ([str(broken)], "")
+
+        window.add_images_to_project()
+
+        assert window.project_document is not None
+        assert len(window.project_document.images) == 1
+        assert dialogs["warning"][-1][0] == "Не все изображения добавлены"
+        assert "broken.png" in dialogs["warning"][-1][1]
+
+
+class TestSyncLargeImages:
+    def _window_with_untracked_images(self, project_window) -> MainWindow:
+        window = project_window()
+        assert window.project_path is not None
+        image_dir = window.project_path.parent / "images"
+        _make_image(image_dir / "big.png", size=LARGE_SIZE)
+        _make_image(image_dir / "small.png", size=(30, 20))
+        return window
+
+    def test_sync_downscales_large_files_in_place(
+        self,
+        project_window,
+        dialogs: dict[str, Any],  # noqa: ARG002
+        downscale_answers: dict[str, Any],
+    ) -> None:
+        window = self._window_with_untracked_images(project_window)
+        assert window.project_path is not None
+
+        window.sync_project_images_folder()
+
+        assert downscale_answers["calls"] == [
+            {"large": [("images/big.png", LARGE_SIZE)], "total": 2, "overwrite": True}
+        ]
+        with Image.open(window.project_path.parent / "images" / "big.png") as image:
+            assert image.size == (1440, 1080)
+        records = {
+            record.relative_path: record
+            for record in load_project(window.project_path).images
+        }
+        assert (
+            records["images/big.png"].image_width,
+            records["images/big.png"].image_height,
+        ) == (1440, 1080)
+        assert (
+            records["images/small.png"].image_width,
+            records["images/small.png"].image_height,
+        ) == (30, 20)
+        assert window.statusBar().currentMessage() == (
+            "Синхронизировано изображений: 2 (уменьшено: 1)"
+        )
+
+    def test_sync_keep_original_leaves_files(
+        self,
+        project_window,
+        dialogs: dict[str, Any],  # noqa: ARG002
+        downscale_answers: dict[str, Any],
+    ) -> None:
+        window = self._window_with_untracked_images(project_window)
+        downscale_answers["answer"] = None
+        assert window.project_path is not None
+        big = window.project_path.parent / "images" / "big.png"
+        original_bytes = big.read_bytes()
+
+        window.sync_project_images_folder()
+
+        assert big.read_bytes() == original_bytes
+        assert window.project_document is not None
+        assert len(window.project_document.images) == 3
+
+    def test_sync_cancel_adds_nothing(
+        self,
+        project_window,
+        dialogs: dict[str, Any],  # noqa: ARG002
+        downscale_answers: dict[str, Any],
+    ) -> None:
+        window = self._window_with_untracked_images(project_window)
+        downscale_answers["answer"] = DOWNSCALE_CANCELLED
+
+        window.sync_project_images_folder()
+
+        assert window.project_document is not None
+        assert len(window.project_document.images) == 1
+
+
+class TestLargeImageDownscaleDialog:
+    def _ask(self, window, monkeypatch, choose, **kwargs):
+        shown: dict[str, Any] = {}
+
+        def fake_exec(dialog) -> int:
+            buttons = dialog.findChildren(QRadioButton)
+            shown["buttons"] = [button.text() for button in buttons]
+            shown["checked"] = [
+                button.text() for button in buttons if button.isChecked()
+            ]
+            shown["text"] = "\n".join(
+                label.text() for label in dialog.findChildren(main_window_module.QLabel)
+            )
+            if choose is None:
+                return QDialog.Rejected
+            buttons[choose].setChecked(True)
+            return QDialog.Accepted
+
+        monkeypatch.setattr(main_window_module.QDialog, "exec_", fake_exec)
+        large = [(f"photo{index}.jpg", (6000, 4000)) for index in range(10)]
+        answer = window._ask_large_image_downscale(large, 12, **kwargs)
+        return answer, shown
+
+    def test_default_is_full_hd(self, project_window, monkeypatch) -> None:
+        window = project_window()
+
+        answer, shown = self._ask(window, monkeypatch, 0, overwrite=False)
+
+        assert answer == FULL_HD
+        assert shown["checked"] == ["1920×1080 (Full HD) — рекомендуется"]
+        assert shown["buttons"][-1] == "Оставить оригинальное разрешение"
+        assert "10 из 12 изображений" in shown["text"]
+        assert "photo7.jpg — 6000×4000" in shown["text"]
+        assert "photo8.jpg" not in shown["text"]
+        assert "…и ещё 2" in shown["text"]
+        assert "перезаписаны" not in shown["text"]
+
+    def test_choices_and_cancel(self, project_window, monkeypatch) -> None:
+        window = project_window()
+
+        assert self._ask(window, monkeypatch, 1, overwrite=True)[0] == HD
+        answer, shown = self._ask(window, monkeypatch, 2, overwrite=True)
+        assert answer is None
+        assert "перезаписаны" in shown["text"]
+        assert (
+            self._ask(window, monkeypatch, None, overwrite=True)[0]
+            == DOWNSCALE_CANCELLED
+        )
+
+
+class TestImagePrepareWorker:
+    def _run(self, job: ImagePrepareJob, *, cancelled: bool = False) -> list:
+        import threading
+
+        event = threading.Event()
+        if cancelled:
+            event.set()
+        worker = _ImagePrepareWorker(3, job, event)
+        emitted: list = []
+        worker.signals.finished.connect(lambda i, r: emitted.append((i, r)))
+        worker.signals.failed.connect(lambda i, m: emitted.append((i, m)))
+        worker.run()
+        return emitted
+
+    def test_copy_and_downscale(self, qapp, tmp_path: Path) -> None:  # noqa: ARG002
+        source = _make_image(tmp_path / "big.png", size=LARGE_SIZE)
+
+        assert self._run(ImagePrepareJob(source, tmp_path / "copy.png")) == [
+            (3, ImagePrepareResult(2600, 1950, downscaled=False))
+        ]
+        assert self._run(ImagePrepareJob(source, tmp_path / "small.png", HD)) == [
+            (3, ImagePrepareResult(960, 720, downscaled=True))
+        ]
+
+    def test_cancelled_job_is_skipped(self, qapp, tmp_path: Path) -> None:  # noqa: ARG002
+        source = _make_image(tmp_path / "leaf.png")
+        destination = tmp_path / "copy.png"
+
+        emitted = self._run(ImagePrepareJob(source, destination), cancelled=True)
+
+        assert emitted == [(3, IMAGE_PREPARE_CANCELLED_TEXT)]
+        assert not destination.exists()
+
+    def test_failure_is_reported(self, qapp, tmp_path: Path) -> None:  # noqa: ARG002
+        emitted = self._run(
+            ImagePrepareJob(tmp_path / "missing.png", tmp_path / "copy.png")
+        )
+
+        assert emitted[0][0] == 3
+        assert "Файл не найден" in emitted[0][1]
+
+
 class TestUniqueDestinationPath:
+    def test_reserved_names_are_skipped(self, tmp_path: Path) -> None:
+        reserved: set[Path] = set()
+
+        assert _unique_destination_path(tmp_path, "leaf.png", reserved=reserved) == (
+            tmp_path / "leaf.png"
+        )
+        assert _unique_destination_path(tmp_path, "leaf.png", reserved=reserved) == (
+            tmp_path / "leaf_1.png"
+        )
+        assert reserved == {tmp_path / "leaf.png", tmp_path / "leaf_1.png"}
+
     def test_free_name_is_used_as_is(self, tmp_path: Path) -> None:
         assert _unique_destination_path(tmp_path, "leaf.png") == tmp_path / "leaf.png"
 
