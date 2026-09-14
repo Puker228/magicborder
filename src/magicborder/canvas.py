@@ -695,6 +695,9 @@ class ImageCanvas(QGraphicsView):
     def current_image_path(self) -> Path | None:
         return self._loaded_image.path if self._loaded_image else None
 
+    def current_pixmap(self) -> QPixmap | None:
+        return self._loaded_image.pixmap if self._loaded_image else None
+
     def image_size(self) -> tuple[int, int] | None:
         if not self._loaded_image:
             return None
@@ -704,6 +707,18 @@ class ImageCanvas(QGraphicsView):
         if not self._loaded_image:
             raise ValueError("Сначала загрузите изображение проекта.")
         return self._loaded_image.rgb_array.copy()
+
+    def current_rgb_array_view(self) -> np.ndarray:
+        """Пиксели текущего кадра без копирования (массив только для чтения).
+
+        Канвас не меняет массив на месте, а заменяет LoadedImage целиком,
+        поэтому view можно безопасно отдавать в рабочие потоки.
+        """
+        if not self._loaded_image:
+            raise ValueError("Сначала загрузите изображение проекта.")
+        view = self._loaded_image.rgb_array.view()
+        view.flags.writeable = False
+        return view
 
     def contour_points(self) -> list[Point]:
         return [Point(point.x(), point.y()) for point in self._contour_points]

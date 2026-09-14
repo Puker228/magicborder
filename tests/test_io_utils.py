@@ -20,10 +20,12 @@ from magicborder.io_utils import (
     load_annotation,
     load_project,
     load_raster_image,
+    load_rgb_array,
     loaded_image_from_rgb_array,
     read_image_captured_at,
     save_annotation,
     save_project,
+    save_rgb_array_atomically,
     write_xlsx_table,
 )
 from magicborder.models import Annotation, Point, ProjectDocument, ProjectImageRecord
@@ -129,6 +131,98 @@ class TestLoadRasterImage:
         assert loaded.rgb_array.dtype == np.uint8
         assert loaded.rgb_array.shape == (7, 9, 3)
         assert (loaded.width, loaded.height) == (9, 7)
+
+
+class TestLightweightImageLoading:
+    def test_loaded_rgb_array_is_read_only(self, qapp, tmp_path: Path) -> None:
+        path = tmp_path / "image.png"
+        Image.new("RGB", (6, 4), (10, 20, 30)).save(path)
+
+        loaded = load_raster_image(path)
+
+        # Массив можно без копии отдавать в рабочие потоки: изменить его нельзя.
+        assert loaded.rgb_array.flags.writeable is False
+        with pytest.raises(ValueError):
+            loaded.rgb_array[0, 0] = (1, 2, 3)
+
+    def test_opaque_image_pixmap_matches_file_pixels(
+        self, qapp, tmp_path: Path
+    ) -> None:
+        rng = np.random.default_rng(5)
+        rgb = rng.integers(0, 256, size=(9, 13, 3), dtype=np.uint8)
+        path = tmp_path / "noise.png"
+        Image.fromarray(rgb).save(path)
+
+        loaded = load_raster_image(path)
+
+        image = loaded.pixmap.toImage()
+        for x, y in ((0, 0), (12, 8), (6, 4)):
+            color = image.pixelColor(x, y)
+            assert (color.red(), color.green(), color.blue()) == tuple(rgb[y, x])
+
+    def test_transparent_png_keeps_alpha_on_screen(self, qapp, tmp_path: Path) -> None:
+        path = tmp_path / "alpha.png"
+        Image.new("RGBA", (4, 4), (200, 100, 50, 0)).save(path)
+
+        loaded = load_raster_image(path)
+
+        assert loaded.qimage.pixelColor(1, 1).alpha() == 0
+        assert tuple(loaded.rgb_array[1, 1]) == (200, 100, 50)
+
+    @pytest.mark.parametrize("mode", ["RGB", "L", "RGBA", "P"])
+    def test_load_rgb_array_matches_pil_conversion(
+        self, tmp_path: Path, mode: str
+    ) -> None:
+        path = tmp_path / "image.png"
+        Image.new("RGB", (5, 3), (200, 100, 50)).convert(mode).save(path)
+
+        rgb_array = load_rgb_array(path)
+
+        with Image.open(path) as image:
+            expected = np.asarray(image.convert("RGB"))
+        assert rgb_array.dtype == np.uint8
+        assert np.array_equal(rgb_array, expected)
+
+    def test_load_rgb_array_validates_path(self, tmp_path: Path) -> None:
+        with pytest.raises(FileNotFoundError):
+            load_rgb_array(tmp_path / "нет.png")
+        broken = tmp_path / "broken.png"
+        broken.write_bytes(b"not a png")
+        with pytest.raises(ValueError, match="Не удалось распознать"):
+            load_rgb_array(broken)
+
+    @pytest.mark.parametrize("suffix", [".png", ".tif", ".bmp"])
+    def test_atomic_save_is_lossless_and_leaves_no_temp_file(
+        self, tmp_path: Path, suffix: str
+    ) -> None:
+        rng = np.random.default_rng(9)
+        rgb = rng.integers(0, 256, size=(12, 16, 3), dtype=np.uint8)
+        path = tmp_path / f"image{suffix}"
+        Image.new("RGB", (16, 12)).save(path)
+
+        save_rgb_array_atomically(rgb, path)
+
+        with Image.open(path) as image:
+            assert np.array_equal(np.asarray(image.convert("RGB")), rgb)
+        assert [item.name for item in tmp_path.iterdir()] == [path.name]
+
+    def test_atomic_save_failure_keeps_original(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "image.png"
+        Image.new("RGB", (4, 4), (1, 2, 3)).save(path)
+
+        def failing_save(*_args, **_kwargs):
+            raise OSError("диск переполнен")
+
+        monkeypatch.setattr(io_utils.Image.Image, "save", failing_save)
+
+        with pytest.raises(OSError, match="диск переполнен"):
+            save_rgb_array_atomically(np.zeros((4, 4, 3), dtype=np.uint8), path)
+        monkeypatch.undo()
+        with Image.open(path) as image:
+            assert image.getpixel((0, 0)) == (1, 2, 3)
+        assert [item.name for item in tmp_path.iterdir()] == ["image.png"]
 
 
 class TestImageOpenFilter:

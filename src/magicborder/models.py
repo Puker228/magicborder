@@ -473,6 +473,7 @@ class ProjectImageFileInfo:
     image_height: int | None = None
     added_at: str = ""
     captured_at: str = ""
+    crop_reviewed: bool = False
 
     def __post_init__(self) -> None:
         self.id = str(self.id or "").strip()
@@ -482,6 +483,7 @@ class ProjectImageFileInfo:
         self.image_height = _optional_positive_int(self.image_height)
         self.added_at = str(self.added_at or "")
         self.captured_at = str(self.captured_at or "")
+        self.crop_reviewed = self.crop_reviewed is True
 
         if not self.id:
             raise ValueError("Запись изображения должна содержать id.")
@@ -499,6 +501,7 @@ class ProjectImageFileInfo:
             },
             "added_at": self.added_at,
             "captured_at": self.captured_at,
+            "crop_reviewed": self.crop_reviewed,
         }
 
     @classmethod
@@ -518,6 +521,7 @@ class ProjectImageFileInfo:
             image_height=_optional_positive_int(image_size.get("height")),
             added_at=str(data.get("added_at", "")),
             captured_at=str(data.get("captured_at", "")),
+            crop_reviewed=data.get("crop_reviewed") is True,
         )
 
 
@@ -719,6 +723,14 @@ class ProjectImageRecord:
     @image_height.setter
     def image_height(self, value: Any) -> None:
         self.file.image_height = _optional_positive_int(value)
+
+    @property
+    def crop_reviewed(self) -> bool:
+        return self.file.crop_reviewed
+
+    @crop_reviewed.setter
+    def crop_reviewed(self, value: bool) -> None:
+        self.file.crop_reviewed = value is True
 
     @property
     def annotation(self) -> Annotation | None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import shutil
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +12,7 @@ import numpy as np
 from PIL import Image
 from PyQt5.QtCore import (
     QDateTime,
+    QEventLoop,
     QObject,
     QRunnable,
     QSignalBlocker,
@@ -40,6 +42,9 @@ from PyQt5.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
+    QProgressDialog,
+    QRadioButton,
     QSizePolicy,
     QSplitter,
     QTextEdit,
@@ -54,30 +59,54 @@ from PyQt5.QtWidgets import (
 from .canvas import ImageCanvas
 from .contour_analysis import (
     ContourAnalysis,
+    ContourColorSums,
     ContourSignature,
     build_contour_analysis,
+    color_stats_from_sums,
+    combine_color_sums,
+    contour_color_sums,
     contour_rgb_pixels_from_points,
     contour_signature,
+    flatten_background_outside_contour,
     hsv_values_from_rgb_pixels,
     lab_values_from_rgb_pixels,
     mean_lms_values_from_total,
     yuv_values_from_rgb_pixels,
 )
+from .crop_dialog import CropDialog
 from .detector import detect_leaf_contour
 from .histograms import (
     HistogramPanel,
     rgb_to_lms,
 )
 from .icons import ACTION_VISUALS, TOOLBAR_ICON_SIZE, apply_action_visual, load_icon
+from .image_crop import (
+    CropBox,
+    apply_crop_to_record,
+    crop_image_file,
+    full_crop_box,
+    is_noop_crop,
+)
+from .image_downscale import (
+    DOWNSCALE_PRESETS,
+    LARGE_IMAGE_THRESHOLD,
+    RECOMMENDED_PRESET_INDEX,
+    DownscalePreset,
+    is_large_image,
+    read_image_header,
+    reducing_presets,
+    verify_raster_image,
+)
 from .io_utils import (
     SUPPORTED_RASTER_SUFFIXES,
     image_open_filter,
     load_annotation,
     load_project,
     load_raster_image,
-    read_image_captured_at,
+    load_rgb_array,
     save_annotation,
     save_project,
+    save_rgb_array_atomically,
     write_xlsx_table,
 )
 from .models import (
@@ -116,7 +145,28 @@ PROJECT_PANEL_DEFAULT_SIZES = [380, 220, 320]
 HISTOGRAM_DEFAULT_SIZES = [170, 170, 170, 170, 170]
 CONTOUR_ANALYSIS_SYNC_PIXEL_LIMIT = 300_000
 CONTOUR_ANALYSIS_PENDING_TEXT = "расчёт..."
+CONTOUR_ANALYSIS_OUTDATED_TEXT = "нажмите «Обновить»"
+HISTOGRAM_MANUAL_REFRESH_TEXT = (
+    "Нажмите «Обновить», чтобы построить гистограммы по текущему контуру."
+)
+ANALYSIS_OUTDATED_STATUS_TEXT = "Данные устарели"
+IMAGE_PREPARE_CANCELLED_TEXT = "Отменено пользователем."
+IMAGE_PREPARE_PROGRESS_DELAY_MS = 300
+CROP_KEPT_STATUS_TEXT = "Фотография оставлена без изменений."
+DOWNSCALE_DIALOG_TITLE = "Понижение разрешения"
+KEEP_RESOLUTION_TEXT = "Оставить исходное разрешение"
+BACKGROUND_TASK_SHUTDOWN_TIMEOUT_MS = 2000
 ContourAnalysisCacheKey = tuple[str | None, str | None, ContourSignature]
+# Путь, mtime_ns и размер файла + сигнатура контура: если меняется файл
+# (например, после выравнивания фона) или контур, запись пересчитывается.
+ProjectColorSumsCacheKey = tuple[str, int, int, ContourSignature]
+ProjectMeanColorStats = tuple[
+    tuple[int, int, int],
+    tuple[int, int, int],
+    tuple[int, int, int],
+    tuple[int, int, int],
+    tuple[int, int, int],
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +228,212 @@ class _ContourAnalysisWorker(QRunnable):
                 analysis=analysis,
             )
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ImageImportCandidate:
+    source: Path
+    label: str
+    captured_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ImagePrepareJob:
+    """Подготовка файла изображения в пуле потоков.
+
+    Без crop файл только проверяется и при необходимости копируется байт в байт:
+    при импорте разрешение не меняется. Обрезка и понижение разрешения
+    выполняются явно, после подтверждения пользователем.
+    """
+
+    source: Path
+    destination: Path
+    crop: CropBox | None = None
+    preset: DownscalePreset | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ImagePrepareResult:
+    width: int
+    height: int
+
+
+def prepare_image_file(job: ImagePrepareJob) -> ImagePrepareResult:
+    if job.crop is not None:
+        width, height = crop_image_file(
+            job.source, job.destination, job.crop, job.preset
+        )
+        return ImagePrepareResult(width, height)
+    if job.preset is not None:
+        raise ValueError("Понижение разрешения выполняется только вместе с обрезкой.")
+
+    width, height = verify_raster_image(job.source)
+    if job.source.resolve() != job.destination.resolve():
+        shutil.copy2(job.source, job.destination)
+    return ImagePrepareResult(width, height)
+
+
+class _ImagePrepareWorkerSignals(QObject):
+    finished = pyqtSignal(int, object)
+    failed = pyqtSignal(int, str)
+
+
+class _ImagePrepareWorker(QRunnable):
+    def __init__(
+        self, index: int, job: ImagePrepareJob, cancel_event: threading.Event
+    ) -> None:
+        super().__init__()
+        self.signals = _ImagePrepareWorkerSignals()
+        self._index = index
+        self._job = job
+        self._cancel_event = cancel_event
+
+    def run(self) -> None:
+        if self._cancel_event.is_set():
+            self.signals.failed.emit(self._index, IMAGE_PREPARE_CANCELLED_TEXT)
+            return
+        try:
+            result = prepare_image_file(self._job)
+        except Exception as exc:  # defensive boundary for worker failures
+            self.signals.failed.emit(self._index, str(exc))
+            return
+        self.signals.finished.emit(self._index, result)
+
+
+class _ContourDetectionWorkerSignals(QObject):
+    finished = pyqtSignal(int, object)
+    failed = pyqtSignal(int, str)
+
+
+class _ContourDetectionWorker(QRunnable):
+    def __init__(self, request_id: int, rgb_array: np.ndarray) -> None:
+        super().__init__()
+        self.signals = _ContourDetectionWorkerSignals()
+        self._request_id = request_id
+        # View только для чтения, без копии: канвас не меняет массив на месте.
+        self._rgb_array = rgb_array
+
+    def run(self) -> None:
+        try:
+            # cv2.grabCut и остальные функции OpenCV отпускают GIL, поэтому
+            # GUI-поток продолжает обрабатывать события, пока идёт расчёт.
+            points = detect_leaf_contour(self._rgb_array)
+        except Exception as exc:  # defensive boundary for worker failures
+            self.signals.failed.emit(self._request_id, str(exc))
+            return
+        self.signals.finished.emit(self._request_id, points)
+
+
+@dataclass(frozen=True, slots=True)
+class PendingContourDetection:
+    request_id: int
+    record_id: str | None
+    image_path: Path | None
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectColorStatsEntry:
+    cache_key: ProjectColorSumsCacheKey
+    image_path: Path
+    points: list[Point]
+    expected_size: tuple[int, int]
+
+
+def compute_project_color_sums(
+    entry: ProjectColorStatsEntry,
+) -> ContourColorSums | None:
+    """Суммы цветов одного изображения проекта. Безопасно вызывать вне GUI-потока."""
+    try:
+        # Только RGB-массив: без QImage/QPixmap, которые для статистики не нужны.
+        rgb_array = load_rgb_array(entry.image_path)
+    except (OSError, ValueError):
+        return None
+    height, width = rgb_array.shape[:2]
+    if (width, height) != entry.expected_size:
+        return None
+    return contour_color_sums(rgb_array, entry.points)
+
+
+class _ProjectColorStatsWorkerSignals(QObject):
+    progress = pyqtSignal(int, int, int)
+    finished = pyqtSignal(int, object)
+    failed = pyqtSignal(int, str)
+
+
+class _ProjectColorStatsWorker(QRunnable):
+    def __init__(
+        self,
+        request_id: int,
+        entries: list[ProjectColorStatsEntry],
+        cancel_event: threading.Event,
+    ) -> None:
+        super().__init__()
+        self.signals = _ProjectColorStatsWorkerSignals()
+        self._request_id = request_id
+        self._entries = entries
+        self._cancel_event = cancel_event
+
+    def run(self) -> None:
+        results: dict[ProjectColorSumsCacheKey, ContourColorSums | None] = {}
+        total = len(self._entries)
+        try:
+            for index, entry in enumerate(self._entries, start=1):
+                if self._cancel_event.is_set():
+                    self.signals.failed.emit(
+                        self._request_id, IMAGE_PREPARE_CANCELLED_TEXT
+                    )
+                    return
+                # Изображения обрабатываются по одному: в памяти не больше
+                # одного декодированного кадра, а не весь проект сразу.
+                results[entry.cache_key] = compute_project_color_sums(entry)
+                self.signals.progress.emit(self._request_id, index, total)
+        except Exception as exc:  # defensive boundary for worker failures
+            self.signals.failed.emit(self._request_id, str(exc))
+            return
+        self.signals.finished.emit(self._request_id, results)
+
+
+@dataclass(slots=True)
+class PendingProjectColorStats:
+    request_id: int
+    entries: list[ProjectColorStatsEntry]
+    cancel_event: threading.Event
+
+
+@dataclass(frozen=True, slots=True)
+class FlattenBackgroundJob:
+    request_id: int
+    record_id: str
+    image_path: Path
+    rgb_array: np.ndarray
+    points: list[Point]
+
+
+def flatten_background_file(job: FlattenBackgroundJob) -> np.ndarray:
+    flattened = flatten_background_outside_contour(job.rgb_array, job.points)
+    save_rgb_array_atomically(flattened, job.image_path)
+    return flattened
+
+
+class _FlattenBackgroundWorkerSignals(QObject):
+    finished = pyqtSignal(int, object)
+    failed = pyqtSignal(int, str)
+
+
+class _FlattenBackgroundWorker(QRunnable):
+    def __init__(self, job: FlattenBackgroundJob) -> None:
+        super().__init__()
+        self.signals = _FlattenBackgroundWorkerSignals()
+        self._job = job
+
+    def run(self) -> None:
+        try:
+            # Маска, заливка и кодирование PNG/JPEG/TIFF идут вне GUI-потока.
+            flattened = flatten_background_file(self._job)
+        except Exception as exc:  # defensive boundary for worker failures
+            self.signals.failed.emit(self._job.request_id, str(exc))
+            return
+        self.signals.finished.emit(self._job.request_id, flattened)
 
 
 class AverageColorSwatch(QFrame):
@@ -420,26 +676,47 @@ class MainWindow(QMainWindow):
             self,
             default_file_name_provider=lambda: self._default_histogram_file_name("lms"),
         )
-        self._histogram_refresh_timer = QTimer(self)
-        self._histogram_refresh_timer.setSingleShot(True)
-        self._histogram_refresh_timer.timeout.connect(self._refresh_histograms)
+        self._analysis_refresh_allowed = False
         self._project_summary_refresh_timer = QTimer(self)
         self._project_summary_refresh_timer.setSingleShot(True)
         self._project_summary_refresh_timer.timeout.connect(
             self._update_project_summary_properties
         )
         self._contour_analysis_thread_pool = QThreadPool.globalInstance()
+        self._image_prepare_thread_pool = QThreadPool(self)
         self._contour_analysis_request_id = 0
         self._contour_analysis_cache: ContourAnalysisWorkResult | None = None
+        self._project_mean_color_stats_cache: ProjectMeanColorStats | None = None
         self._pending_contour_analysis_key: ContourAnalysisCacheKey | None = None
         self._pending_contour_analysis_request_id: int | None = None
         self._contour_analysis_workers: set[_ContourAnalysisWorker] = set()
+        # Тяжёлые команды над изображениями выполняются в пуле потоков, чтобы
+        # цикл событий Qt не останавливался и Windows не помечала окно «Не отвечает».
+        self._contour_detection_thread_pool = QThreadPool.globalInstance()
+        self._contour_detection_request_id = 0
+        self._pending_contour_detection: PendingContourDetection | None = None
+        # Ссылки на воркеры по request_id: без них сборщик мусора может удалить
+        # объект сигналов раньше, чем поток их отправит.
+        self._contour_detection_workers: dict[int, _ContourDetectionWorker] = {}
+        self._project_color_stats_thread_pool = QThreadPool.globalInstance()
+        self._project_color_stats_request_id = 0
+        self._pending_project_color_stats: PendingProjectColorStats | None = None
+        self._project_color_stats_workers: dict[int, _ProjectColorStatsWorker] = {}
+        self._project_color_sums_cache: dict[
+            ProjectColorSumsCacheKey, ContourColorSums | None
+        ] = {}
+        self._flatten_background_thread_pool = QThreadPool.globalInstance()
+        self._flatten_background_request_id = 0
+        self._pending_flatten_background: FlattenBackgroundJob | None = None
+        self._flatten_background_workers: dict[int, _FlattenBackgroundWorker] = {}
+        self._busy_task_count = 0
         self._current_average_color_rgb: tuple[int, int, int] | None = None
 
         self.project_document: ProjectDocument | None = None
         self.project_path: Path | None = None
         self._current_project_image_id: str | None = None
         self._loading_project_image = False
+        self._crop_dialog_open = False
         self._updating_project_list = False
         self._updating_project_identity_fields = False
         self._updating_project_info_fields = False
@@ -465,12 +742,18 @@ class MainWindow(QMainWindow):
         self._create_toolbar()
 
         self.statusBar().showMessage("Откройте фотографию листа растения.")
+        # Неблокирующий индикатор фоновой работы в статус-баре: окно остаётся
+        # интерактивным, а пользователь видит, что расчёт идёт.
+        self.busy_progress = QProgressBar(self)
+        self.busy_progress.setObjectName("busyProgress")
+        self.busy_progress.setMaximumWidth(180)
+        self.busy_progress.setTextVisible(False)
+        self.busy_progress.hide()
+        self.statusBar().addPermanentWidget(self.busy_progress)
         self.canvas.message_changed.connect(self.statusBar().showMessage)
         self.canvas.image_state_changed.connect(self._update_action_states)
-        self.canvas.image_state_changed.connect(self._schedule_histogram_refresh)
         self.canvas.image_state_changed.connect(self._update_project_properties)
         self.canvas.contour_state_changed.connect(self._update_action_states)
-        self.canvas.contour_geometry_changed.connect(self._schedule_histogram_refresh)
         self.canvas.contour_geometry_changed.connect(
             self._handle_contour_geometry_changed
         )
@@ -1769,6 +2052,28 @@ class MainWindow(QMainWindow):
         analysis_title = QLabel("Свойства и аналитика")
         analysis_title.setObjectName("analysisTitle")
 
+        self.analysis_status_label = QLabel("")
+        self.analysis_status_label.setObjectName("analysisStatus")
+        self.analysis_status_label.setWordWrap(True)
+
+        self.refresh_analysis_button = QToolButton(analysis_panel)
+        self.refresh_analysis_button.setObjectName("refreshAnalysisButton")
+        self.refresh_analysis_button.setText("Обновить")
+        self.refresh_analysis_button.setIcon(load_icon("refresh-analysis"))
+        self.refresh_analysis_button.setToolTip("Обновить графики (F9)")
+        self.refresh_analysis_button.setStatusTip(
+            "Пересчитать гистограммы и аналитику по загруженным изображениям."
+        )
+        self.refresh_analysis_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.refresh_analysis_button.clicked.connect(self.refresh_analysis)
+
+        analysis_header_layout = QHBoxLayout()
+        analysis_header_layout.setContentsMargins(0, 0, 0, 0)
+        analysis_header_layout.setSpacing(6)
+        analysis_header_layout.addWidget(analysis_title)
+        analysis_header_layout.addWidget(self.analysis_status_label, 1)
+        analysis_header_layout.addWidget(self.refresh_analysis_button)
+
         self.histogram_splitter = QSplitter(Qt.Vertical, analysis_panel)
         self.histogram_splitter.setChildrenCollapsible(False)
         self.histogram_splitter.addWidget(self.rgb_histogram_panel)
@@ -1785,12 +2090,14 @@ class MainWindow(QMainWindow):
         analysis_layout = QVBoxLayout(analysis_panel)
         analysis_layout.setContentsMargins(10, 10, 10, 10)
         analysis_layout.setSpacing(8)
-        analysis_layout.addWidget(analysis_title)
+        analysis_layout.addLayout(analysis_header_layout)
         analysis_layout.addWidget(self.histogram_splitter, 1)
 
         analysis_panel.setStyleSheet(
             "QWidget#analysisPanel { background: #f7f9fc; border-left: 1px solid #d6dde8; }"
             "QLabel#analysisTitle { color: #1f2937; font-size: 13px; font-weight: 600; }"
+            "QLabel#analysisStatus { color: #b45309; font-size: 11px; }"
+            "QToolButton#refreshAnalysisButton { padding: 5px 10px; font-weight: 600; }"
             "QFrame#histogramPanel { background: #ffffff; border: 1px solid #ccd6e1; border-radius: 6px; }"
             "QLabel#histogramTitle { color: #1f2937; font-size: 12px; font-weight: 600; }"
             "QToolButton { border: 1px solid transparent; border-radius: 4px; padding: 4px; }"
@@ -1857,6 +2164,10 @@ class MainWindow(QMainWindow):
         self.actual_size_action.setShortcut("Ctrl+0")
         self.actual_size_action.triggered.connect(self.canvas.reset_zoom)
 
+        self.crop_image_action = QAction("Обрезать...", self)
+        self.crop_image_action.setShortcut("Ctrl+Shift+X")
+        self.crop_image_action.triggered.connect(lambda: self.crop_current_image())
+
         self.default_view_action = QAction("Вид по умолчанию", self)
         self.default_view_action.setShortcut("Ctrl+R")
         self.default_view_action.triggered.connect(self.restore_default_view)
@@ -1913,6 +2224,10 @@ class MainWindow(QMainWindow):
         self.open_annotation_action.setShortcut("Ctrl+Shift+O")
         self.open_annotation_action.triggered.connect(self.open_annotation_file)
 
+        self.refresh_analysis_action = QAction("Обновить", self)
+        self.refresh_analysis_action.setShortcut("F9")
+        self.refresh_analysis_action.triggered.connect(self.refresh_analysis)
+
         self.about_action = QAction("О программе", self)
         self.about_action.triggered.connect(self.show_about_dialog)
 
@@ -1932,6 +2247,7 @@ class MainWindow(QMainWindow):
             "zoom_out": self.zoom_out_action,
             "fit_image": self.fit_image_action,
             "actual_size": self.actual_size_action,
+            "crop_image": self.crop_image_action,
             "default_view": self.default_view_action,
             "show_all_canvas_elements": self.show_all_canvas_elements_action,
             "hide_all_canvas_elements": self.hide_all_canvas_elements_action,
@@ -1947,6 +2263,7 @@ class MainWindow(QMainWindow):
             "delete_segment": self.delete_segment_action,
             "save_annotation": self.save_annotation_action,
             "open_annotation": self.open_annotation_action,
+            "refresh_analysis": self.refresh_analysis_action,
             "about": self.about_action,
         }
 
@@ -1973,11 +2290,14 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.zoom_out_action)
         view_menu.addAction(self.fit_image_action)
         view_menu.addAction(self.actual_size_action)
+        view_menu.addAction(self.crop_image_action)
         view_menu.addSeparator()
         view_menu.addAction(self.default_view_action)
         view_menu.addSeparator()
         view_menu.addAction(self.show_all_canvas_elements_action)
         view_menu.addAction(self.hide_all_canvas_elements_action)
+        view_menu.addSeparator()
+        view_menu.addAction(self.refresh_analysis_action)
 
         tools_menu = self.menuBar().addMenu("Инструменты")
         tools_menu.addAction(self.new_contour_action)
@@ -2024,10 +2344,13 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.zoom_out_action)
         toolbar.addAction(self.fit_image_action)
         toolbar.addAction(self.actual_size_action)
+        toolbar.addAction(self.crop_image_action)
         toolbar.addAction(self.default_view_action)
         toolbar.addSeparator()
         toolbar.addAction(self.show_all_canvas_elements_action)
         toolbar.addAction(self.hide_all_canvas_elements_action)
+        toolbar.addSeparator()
+        toolbar.addAction(self.refresh_analysis_action)
         toolbar.addSeparator()
         toolbar.addAction(self.new_contour_action)
         toolbar.addAction(self.detect_contour_action)
@@ -2050,6 +2373,7 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.exit_action)
 
     def _update_action_states(self, *_args) -> None:
+        self._update_analysis_status()
         has_image = self.canvas.has_image()
         has_contour = self.canvas.has_contour()
         has_project = self.project_document is not None
@@ -2079,13 +2403,26 @@ class MainWindow(QMainWindow):
         self.actual_size_action.setEnabled(has_image)
         self.show_all_canvas_elements_action.setEnabled(has_project_image and has_image)
         self.hide_all_canvas_elements_action.setEnabled(has_project_image and has_image)
-        self.new_contour_action.setEnabled(has_project_image and has_image)
-        self.detect_contour_action.setEnabled(has_project_image and has_image)
+        # Пока фоновая задача меняет контур или пиксели текущего кадра,
+        # конфликтующие команды выключены: их результат перезаписал бы друг друга.
+        image_job_pending = (
+            self._pending_contour_detection is not None
+            or self._pending_flatten_background is not None
+        )
+        self.new_contour_action.setEnabled(
+            has_project_image and has_image and not image_job_pending
+        )
+        self.detect_contour_action.setEnabled(
+            has_project_image and has_image and not image_job_pending
+        )
         self.delete_contour_action.setEnabled(
             has_project_image and (has_contour or has_project_contour)
         )
         self.flatten_background_action.setEnabled(
-            has_project_image and has_image and has_contour
+            has_project_image and has_image and has_contour and not image_job_pending
+        )
+        self.crop_image_action.setEnabled(
+            has_project_image and has_image and not image_job_pending
         )
         self.calibrate_scale_action.setEnabled(has_project_image and has_image)
         self.reset_calibration_action.setEnabled(has_project_image and has_calibration)
@@ -2100,7 +2437,11 @@ class MainWindow(QMainWindow):
             and self.canvas.has_selected_segment_endpoint()
         )
         self.save_annotation_action.setEnabled(has_project_image and has_contour)
-        self.open_annotation_action.setEnabled(has_project_image)
+        self.open_annotation_action.setEnabled(
+            has_project_image and not image_job_pending
+        )
+        self.refresh_analysis_action.setEnabled(has_project)
+        self.refresh_analysis_button.setEnabled(has_project)
 
     def restore_default_view(self) -> None:
         self._restore_splitter_defaults()
@@ -2198,10 +2539,36 @@ class MainWindow(QMainWindow):
             return measurement_type, measurement_id
         return None
 
-    def _schedule_histogram_refresh(self, *_args) -> None:
-        self._histogram_refresh_timer.start(120)
+    def refresh_analysis(self) -> None:
+        self._analysis_refresh_allowed = True
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self._refresh_histograms()
+            self._update_project_summary_properties()
+            self._update_project_properties()
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._analysis_refresh_allowed = False
+
+        self._update_action_states()
+        if self._is_current_contour_analysis_pending():
+            self.statusBar().showMessage("Идёт расчёт графиков...")
+        elif self.canvas.has_image() and self.canvas.has_contour():
+            self.statusBar().showMessage("Графики и аналитика обновлены.")
+        else:
+            self.statusBar().showMessage(
+                "Нечего пересчитывать: выберите изображение с контуром."
+            )
 
     def _refresh_histograms(self) -> None:
+        previously_allowed = self._analysis_refresh_allowed
+        self._analysis_refresh_allowed = True
+        try:
+            self._apply_refreshed_histograms()
+        finally:
+            self._analysis_refresh_allowed = previously_allowed
+
+    def _apply_refreshed_histograms(self) -> None:
         result = self._ensure_current_contour_analysis(defer_large_async=False)
         if result is None:
             if self._is_current_contour_analysis_pending():
@@ -2240,6 +2607,7 @@ class MainWindow(QMainWindow):
                 )
             else:
                 panel.set_histogram(histogram)
+        self._update_analysis_status()
 
     def _clear_histograms(self, message: str) -> None:
         for panel in (
@@ -2250,6 +2618,7 @@ class MainWindow(QMainWindow):
             self.lms_histogram_panel,
         ):
             panel.clear_histogram(message)
+        self._update_analysis_status()
 
     def _ensure_current_contour_analysis(
         self,
@@ -2266,21 +2635,20 @@ class MainWindow(QMainWindow):
             return self._contour_analysis_cache
         if self._pending_contour_analysis_key == key:
             return None
+        if not self._analysis_refresh_allowed:
+            return None
 
         image_size = self.canvas.image_size()
         if image_size is None:
             return None
         width, height = image_size
         is_large_image = width * height > CONTOUR_ANALYSIS_SYNC_PIXEL_LIMIT
-        if (
-            is_large_image
-            and defer_large_async
-            and self._histogram_refresh_timer.isActive()
-        ):
+        if is_large_image and defer_large_async:
             return None
 
         try:
-            rgb_array = self.canvas.current_rgb_array()
+            # Без копии: массив только для чтения, канвас его не меняет.
+            rgb_array = self.canvas.current_rgb_array_view()
         except ValueError as exc:
             self._clear_histograms(str(exc))
             return None
@@ -2361,16 +2729,26 @@ class MainWindow(QMainWindow):
         inputs = self._current_contour_analysis_inputs(record)
         if inputs is None:
             return False
-        if self._pending_contour_analysis_key == inputs[0]:
-            return True
-        image_size = self.canvas.image_size()
-        if image_size is None:
+        return self._pending_contour_analysis_key == inputs[0]
+
+    def _is_current_contour_analysis_outdated(
+        self,
+        record: ProjectImageRecord | None = None,
+    ) -> bool:
+        inputs = self._current_contour_analysis_inputs(record)
+        if inputs is None:
             return False
-        width, height = image_size
-        return (
-            width * height > CONTOUR_ANALYSIS_SYNC_PIXEL_LIMIT
-            and self._histogram_refresh_timer.isActive()
-        )
+        if self._contour_analysis_cache_matches(inputs[0]):
+            return False
+        return not self._is_current_contour_analysis_pending(record)
+
+    def _update_analysis_status(self) -> None:
+        if self._is_current_contour_analysis_pending():
+            self.analysis_status_label.setText(CONTOUR_ANALYSIS_PENDING_TEXT)
+        elif self._is_current_contour_analysis_outdated():
+            self.analysis_status_label.setText(ANALYSIS_OUTDATED_STATUS_TEXT)
+        else:
+            self.analysis_status_label.setText("")
 
     def _is_contour_analysis_result_current(
         self, result: ContourAnalysisWorkResult
@@ -2547,27 +2925,40 @@ class MainWindow(QMainWindow):
             )
             return
 
-        for file_name in file_names:
-            source_path = Path(file_name)
-            try:
-                loaded_image = load_raster_image(source_path)
-                destination_path = _unique_destination_path(image_dir, source_path.name)
-                if source_path.resolve() != destination_path.resolve():
-                    shutil.copy2(source_path, destination_path)
-            except (OSError, ValueError) as exc:
-                errors.append(f"{source_path.name}: {exc}")
+        candidates = self._probe_image_import_candidates(
+            [(Path(file_name), Path(file_name).name) for file_name in file_names],
+            errors,
+        )
+
+        # Файлы копируются в исходном разрешении; обрезка и понижение разрешения
+        # предлагаются при первом открытии изображения.
+        reserved_paths: set[Path] = set()
+        jobs = [
+            ImagePrepareJob(
+                source=candidate.source,
+                destination=_unique_destination_path(
+                    image_dir, candidate.source.name, reserved=reserved_paths
+                ),
+            )
+            for candidate in candidates
+        ]
+        results = self._run_image_prepare_jobs(jobs)
+
+        for candidate, job, result in zip(candidates, jobs, results, strict=True):
+            if isinstance(result, str):
+                errors.append(f"{candidate.label}: {result}")
                 continue
 
             record_id = self._new_project_image_id()
             record = ProjectImageRecord(
                 id=record_id,
-                relative_path=portable_path_reference(destination_path, project_dir),
-                display_name=destination_path.name,
-                image_width=loaded_image.width,
-                image_height=loaded_image.height,
+                relative_path=portable_path_reference(job.destination, project_dir),
+                display_name=job.destination.name,
+                image_width=result.width,
+                image_height=result.height,
                 metadata=default_project_image_metadata(
                     added_at=_current_timestamp(),
-                    captured_at=read_image_captured_at(source_path),
+                    captured_at=candidate.captured_at,
                 ),
             )
             self.project_document.images.append(record)
@@ -2613,17 +3004,27 @@ class MainWindow(QMainWindow):
             _project_relative_path_key(record.relative_path)
             for record in self.project_document.images
         }
-
+        untracked_paths: list[tuple[Path, str]] = []
         for image_path in candidate_paths:
             relative_path = portable_path_reference(image_path, project_dir)
             relative_path_key = _project_relative_path_key(relative_path)
             if relative_path_key in existing_paths:
                 continue
+            existing_paths.add(relative_path_key)
+            untracked_paths.append((image_path, relative_path))
 
-            try:
-                loaded_image = load_raster_image(image_path)
-            except (OSError, ValueError) as exc:
-                errors.append(f"{relative_path}: {exc}")
+        candidates = self._probe_image_import_candidates(untracked_paths, errors)
+
+        # Файлы в папке проекта только проверяются и не перезаписываются.
+        jobs = [
+            ImagePrepareJob(source=candidate.source, destination=candidate.source)
+            for candidate in candidates
+        ]
+        results = self._run_image_prepare_jobs(jobs)
+
+        for candidate, result in zip(candidates, results, strict=True):
+            if isinstance(result, str):
+                errors.append(f"{candidate.label}: {result}")
                 continue
 
             try:
@@ -2634,17 +3035,16 @@ class MainWindow(QMainWindow):
 
             record = ProjectImageRecord(
                 id=record_id,
-                relative_path=relative_path,
-                display_name=image_path.name,
-                image_width=loaded_image.width,
-                image_height=loaded_image.height,
+                relative_path=candidate.label,
+                display_name=candidate.source.name,
+                image_width=result.width,
+                image_height=result.height,
                 metadata=default_project_image_metadata(
                     added_at=_current_timestamp(),
-                    captured_at=read_image_captured_at(image_path),
+                    captured_at=candidate.captured_at,
                 ),
             )
             self.project_document.images.append(record)
-            existing_paths.add(relative_path_key)
             added_ids.append(record.id)
 
         if added_ids:
@@ -2662,6 +3062,83 @@ class MainWindow(QMainWindow):
             self._show_warning(
                 "Не все изображения синхронизированы", "\n".join(errors[:8])
             )
+
+    def _probe_image_import_candidates(
+        self, sources: list[tuple[Path, str]], errors: list[str]
+    ) -> list[ImageImportCandidate]:
+        candidates: list[ImageImportCandidate] = []
+        for source, label in sources:
+            try:
+                _size, captured_at = read_image_header(source)
+            except (OSError, ValueError) as exc:
+                errors.append(f"{label}: {exc}")
+                continue
+            candidates.append(
+                ImageImportCandidate(
+                    source=source,
+                    label=label,
+                    captured_at=captured_at,
+                )
+            )
+        return candidates
+
+    def _run_image_prepare_jobs(
+        self,
+        jobs: list[ImagePrepareJob],
+        *,
+        title: str = "Добавление изображений",
+        label: str = "Подготовка изображений…",
+    ) -> list[ImagePrepareResult | str]:
+        """Выполняет задачи в пуле потоков, не блокируя цикл событий Qt."""
+        if not jobs:
+            return []
+
+        results: list[ImagePrepareResult | str | None] = [None] * len(jobs)
+        remaining = len(jobs)
+        cancel_event = threading.Event()
+        loop = QEventLoop(self)
+
+        progress = QProgressDialog(label, "Отмена", 0, len(jobs), self)
+        progress.setWindowTitle(title)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(IMAGE_PREPARE_PROGRESS_DELAY_MS)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        progress.canceled.connect(cancel_event.set)
+
+        def store_result(index: int, result: ImagePrepareResult | str) -> None:
+            nonlocal remaining
+            if results[index] is not None:
+                return
+            results[index] = result
+            remaining -= 1
+            progress.setValue(len(jobs) - remaining)
+            if remaining == 0:
+                loop.quit()
+
+        workers: list[_ImagePrepareWorker] = []
+        for index, job in enumerate(jobs):
+            worker = _ImagePrepareWorker(index, job, cancel_event)
+            worker.signals.finished.connect(store_result)
+            worker.signals.failed.connect(store_result)
+            workers.append(worker)
+            self._image_prepare_thread_pool.start(worker)
+
+        QApplication.setOverrideCursor(Qt.BusyCursor)
+        try:
+            if remaining:
+                loop.exec_()
+        finally:
+            QApplication.restoreOverrideCursor()
+            progress.canceled.disconnect()
+            progress.close()
+            progress.deleteLater()
+
+        return [
+            result if result is not None else IMAGE_PREPARE_CANCELLED_TEXT
+            for result in results
+        ]
 
     def remove_selected_project_image(self) -> None:
         if self.project_document is None or self.project_path is None:
@@ -3459,9 +3936,9 @@ class MainWindow(QMainWindow):
             return row
 
         try:
-            loaded_image = load_raster_image(image_path)
+            # Для экспорта нужны только пиксели: QImage/QPixmap не создаются.
             rgb_pixels = _annotation_rgb_pixels(
-                loaded_image.rgb_array, record.annotation
+                load_rgb_array(image_path), record.annotation
             )
         except (OSError, ValueError) as exc:
             row["status"] = f"ошибка: {exc}"
@@ -3530,7 +4007,7 @@ class MainWindow(QMainWindow):
             return
 
         self._save_current_project_annotation()
-        self._refresh_histograms()
+        self._clear_histograms(HISTOGRAM_MANUAL_REFRESH_TEXT)
         self._update_project_properties()
         self._update_action_states()
         self.statusBar().showMessage(f"Создан новый контур: {len(points)} узлов.")
@@ -3541,12 +4018,21 @@ class MainWindow(QMainWindow):
                 "Нет изображения", "Сначала выберите изображение проекта."
             )
             return
+        if self._pending_contour_detection is not None:
+            return
         self.canvas.cancel_angle_measurement(show_message=False)
         self.canvas.cancel_segment_measurement(show_message=False)
 
+        rgb_array = self.canvas.current_rgb_array_view()
+        height, width = rgb_array.shape[:2]
+        if width * height > CONTOUR_ANALYSIS_SYNC_PIXEL_LIMIT:
+            self._start_contour_detection(rgb_array)
+            return
+
+        # Маленький кадр посчитать сразу быстрее, чем передавать его в поток.
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            points = detect_leaf_contour(self.canvas.current_rgb_array())
+            points = detect_leaf_contour(rgb_array)
             self.canvas.set_contour(points)
         except ValueError as exc:
             self._show_error("Не удалось определить контур", str(exc))
@@ -3554,6 +4040,68 @@ class MainWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
 
+        self._apply_detected_contour_status(points)
+
+    def _start_contour_detection(self, rgb_array: np.ndarray) -> None:
+        self._contour_detection_request_id += 1
+        request_id = self._contour_detection_request_id
+        # Запоминаем изображение: пока идёт расчёт, пользователь может выбрать
+        # другое фото, и тогда результат применять нельзя.
+        self._pending_contour_detection = PendingContourDetection(
+            request_id=request_id,
+            record_id=self._current_project_image_id,
+            image_path=self.canvas.current_image_path(),
+        )
+        worker = _ContourDetectionWorker(request_id, rgb_array)
+        worker.signals.finished.connect(self._handle_contour_detection_finished)
+        worker.signals.failed.connect(self._handle_contour_detection_failed)
+        self._contour_detection_workers[request_id] = worker
+        self._begin_busy("Поиск контура листа…")
+        self._update_action_states()
+        self._contour_detection_thread_pool.start(worker)
+
+    def _finish_contour_detection(self, request_id: int) -> bool:
+        """Снимает ожидание детекции; True, если результат ещё относится к текущему кадру."""
+        self._contour_detection_workers.pop(request_id, None)
+        pending = self._pending_contour_detection
+        if pending is None or pending.request_id != request_id:
+            return False
+        self._pending_contour_detection = None
+        self._end_busy()
+        self._update_action_states()
+        return (
+            pending.record_id == self._current_project_image_id
+            and pending.image_path == self.canvas.current_image_path()
+            and self.canvas.has_image()
+        )
+
+    def _handle_contour_detection_finished(
+        self, request_id: int, points: list[Point]
+    ) -> None:
+        if not self._finish_contour_detection(request_id):
+            return
+        try:
+            self.canvas.set_contour(points)
+        except ValueError as exc:
+            self._show_error("Не удалось определить контур", str(exc))
+            return
+        self._apply_detected_contour_status(points)
+
+    def _handle_contour_detection_failed(self, request_id: int, message: str) -> None:
+        if not self._finish_contour_detection(request_id):
+            return
+        self._show_error("Не удалось определить контур", message)
+
+    def _cancel_contour_detection(self) -> None:
+        # grabCut нельзя прервать; отмена означает, что его результат будет проигнорирован.
+        if self._pending_contour_detection is None:
+            return
+        self._contour_detection_request_id += 1
+        self._pending_contour_detection = None
+        self._end_busy()
+
+    def _apply_detected_contour_status(self, points: list[Point]) -> None:
+        self._clear_histograms(HISTOGRAM_MANUAL_REFRESH_TEXT)
         self.statusBar().showMessage(f"Контур построен: {len(points)} узлов.")
 
     def delete_current_contour(self) -> None:
@@ -3621,32 +4169,102 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.Yes:
             return
 
-        try:
-            previous_rgb = self.canvas.current_rgb_array()
-        except ValueError as exc:
-            self._show_error("Не удалось выровнять фон", str(exc))
+        rgb_array = self.canvas.current_rgb_array_view()
+        points = self.canvas.contour_points()
+        height, width = rgb_array.shape[:2]
+        if width * height > CONTOUR_ANALYSIS_SYNC_PIXEL_LIMIT:
+            self._start_flatten_background(record, image_path, rgb_array, points)
             return
 
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            self._invalidate_current_contour_analysis()
-            self.canvas.flatten_background_to_white()
-            self._save_rgb_array_to_image_file(
-                self.canvas.current_rgb_array(), image_path
+            flattened = flatten_background_file(
+                FlattenBackgroundJob(
+                    request_id=self._flatten_background_request_id,
+                    record_id=record.id,
+                    image_path=image_path,
+                    rgb_array=rgb_array,
+                    points=points,
+                )
             )
-            saved_image = load_raster_image(image_path)
-            self._invalidate_current_contour_analysis()
-            self.canvas.replace_current_rgb_array(saved_image.rgb_array)
         except (OSError, ValueError) as exc:
-            self._invalidate_current_contour_analysis()
-            try:
-                self.canvas.replace_current_rgb_array(previous_rgb)
-            except ValueError:
-                pass
+            # Канвас ещё не менялся: файл и экран остаются согласованными, откат не нужен.
             self._show_error("Не удалось выровнять фон", str(exc))
             return
         finally:
             QApplication.restoreOverrideCursor()
+
+        self._apply_flattened_background(flattened)
+
+    def _start_flatten_background(
+        self,
+        record: ProjectImageRecord,
+        image_path: Path,
+        rgb_array: np.ndarray,
+        points: list[Point],
+    ) -> None:
+        self._flatten_background_request_id += 1
+        job = FlattenBackgroundJob(
+            request_id=self._flatten_background_request_id,
+            record_id=record.id,
+            image_path=image_path,
+            rgb_array=rgb_array,
+            points=points,
+        )
+        self._pending_flatten_background = job
+        worker = _FlattenBackgroundWorker(job)
+        worker.signals.finished.connect(self._handle_flatten_background_finished)
+        worker.signals.failed.connect(self._handle_flatten_background_failed)
+        self._flatten_background_workers[job.request_id] = worker
+        self._begin_busy("Выравнивание фона и сохранение изображения…")
+        self._update_action_states()
+        self._flatten_background_thread_pool.start(worker)
+
+    def _finish_flatten_background(
+        self, request_id: int
+    ) -> FlattenBackgroundJob | None:
+        self._flatten_background_workers.pop(request_id, None)
+        job = self._pending_flatten_background
+        if job is None or job.request_id != request_id:
+            return None
+        self._pending_flatten_background = None
+        self._end_busy()
+        self._update_action_states()
+        return job
+
+    def _handle_flatten_background_finished(
+        self, request_id: int, flattened: np.ndarray
+    ) -> None:
+        job = self._finish_flatten_background(request_id)
+        if job is None:
+            return
+        if (
+            job.record_id != self._current_project_image_id
+            or self.canvas.current_image_path() != job.image_path.resolve()
+        ):
+            # Файл уже сохранён; другое фото на экране не трогаем. При возврате
+            # к этому изображению оно загрузится с диска уже с белым фоном.
+            self._project_mean_color_stats_cache = None
+            self.statusBar().showMessage(
+                f"Фон выровнен и сохранён: {job.image_path.name}"
+            )
+            return
+        self._apply_flattened_background(flattened)
+
+    def _handle_flatten_background_failed(self, request_id: int, message: str) -> None:
+        if self._finish_flatten_background(request_id) is None:
+            return
+        self._show_error("Не удалось выровнять фон", message)
+
+    def _apply_flattened_background(self, flattened: np.ndarray) -> None:
+        # Сохранённые пиксели уже есть в памяти: повторно декодировать только что
+        # записанный файл (как раньше через load_raster_image) не нужно.
+        self._invalidate_current_contour_analysis()
+        try:
+            self.canvas.replace_current_rgb_array(flattened)
+        except ValueError as exc:
+            self._show_error("Не удалось выровнять фон", str(exc))
+            return
 
         if self._should_defer_project_summary_refresh():
             self._schedule_project_summary_refresh()
@@ -3657,23 +4275,224 @@ class MainWindow(QMainWindow):
             "Фон за пределами контура выровнен до белого, изображение сохранено."
         )
 
-    def _save_rgb_array_to_image_file(
-        self, rgb_array: np.ndarray, image_path: Path
-    ) -> None:
-        temp_path = image_path.with_name(
-            f".{image_path.stem}.magicborder-{uuid4().hex}{image_path.suffix}"
+    def crop_current_image(self, *, initial: bool = False) -> bool:
+        """Обрезка и необязательное понижение разрешения; True, если файл изменён."""
+        if self._crop_dialog_open:
+            return False
+        record = self._current_project_image()
+        if record is None or not self.canvas.has_image():
+            if not initial:
+                self._show_warning(
+                    "Нет изображения", "Сначала выберите изображение проекта."
+                )
+            return False
+        if (
+            self._pending_contour_detection is not None
+            or self._pending_flatten_background is not None
+        ):
+            if not initial:
+                self._show_warning(
+                    "Изображение занято",
+                    "Дождитесь завершения фоновой обработки изображения.",
+                )
+            return False
+
+        image_path = self._project_image_path(record)
+        if not image_path.exists():
+            if not initial:
+                self._show_error(
+                    "Не удалось обрезать изображение",
+                    f"Файл изображения не найден: {image_path}",
+                )
+            return False
+
+        self._store_current_angle_measurements()
+        self._store_current_segment_measurements()
+        self._save_current_project_annotation()
+
+        image_size = self.canvas.image_size()
+        if image_size is None:
+            return False
+
+        # Шаг 1: обрезка в исходном разрешении.
+        self._crop_dialog_open = True
+        try:
+            chosen_box = self._exec_crop_dialog(record)
+            self._mark_crop_reviewed(record)
+            if record.id != self._current_project_image_id:
+                return False
+            # «Оставить как есть» отказывается только от обрезки: кадр остаётся
+            # целым, а понизить разрешение всё равно предлагается.
+            crop_box = chosen_box or full_crop_box(image_size)
+
+            # Шаг 2: необязательное понижение разрешения.
+            preset = None
+            if reducing_presets(crop_box.size):
+                preset = self._exec_downscale_dialog(
+                    record, crop_box.size, cropped=not crop_box.is_full(image_size)
+                )
+        finally:
+            self._crop_dialog_open = False
+
+        if is_noop_crop(crop_box, preset, image_size):
+            self.statusBar().showMessage(CROP_KEPT_STATUS_TEXT)
+            return False
+
+        # Обрезка и уменьшение записываются одним сохранением, без промежуточного
+        # файла и повторного сжатия JPEG.
+        (result,) = self._run_image_prepare_jobs(
+            [ImagePrepareJob(image_path, image_path, crop=crop_box, preset=preset)],
+            title="Обработка изображения",
+            label="Сохранение изображения…",
+        )
+        if isinstance(result, str):
+            # Запись атомарная: при ошибке файл и запись проекта остаются прежними.
+            if result != IMAGE_PREPARE_CANCELLED_TEXT:
+                self._show_error("Не удалось обработать изображение", result)
+            return False
+
+        output_size = (result.width, result.height)
+        apply_crop_to_record(record, crop_box, output_size)
+        self._invalidate_current_contour_analysis()
+        self._project_mean_color_stats_cache = None
+        # Перечитываем кадр с диска: канвас получает новый размер сцены и вписывает
+        # изображение в окно, а пересчитанные контур и измерения совпадают по размеру.
+        self._load_project_image(record)
+        self._save_project_silently(show_error=True)
+        self.statusBar().showMessage(
+            _image_processed_status(
+                cropped=not crop_box.is_full(image_size),
+                downscaled=output_size != crop_box.size,
+                size=output_size,
+            )
+        )
+        return True
+
+    def _exec_crop_dialog(self, record: ProjectImageRecord) -> CropBox | None:
+        pixmap = self.canvas.current_pixmap()
+        if pixmap is None:
+            return None
+        has_geometry = bool(
+            record.annotation is not None
+            or record.calibration is not None
+            or record.measurements.angles
+            or record.measurements.segments
+        )
+        dialog = CropDialog(
+            pixmap,
+            display_name=record.display_name,
+            geometry_note=has_geometry,
+            parent=self,
         )
         try:
-            Image.fromarray(np.asarray(rgb_array, dtype=np.uint8), mode="RGB").save(
-                temp_path
+            if dialog.exec_() != QDialog.Accepted:
+                return None
+            return dialog.crop_box()
+        finally:
+            dialog.deleteLater()
+
+    def _exec_downscale_dialog(
+        self,
+        record: ProjectImageRecord,
+        size: tuple[int, int],
+        *,
+        cropped: bool,
+    ) -> DownscalePreset | None:
+        """Предлагает понизить разрешение; None — сохранить исходное разрешение."""
+        width, height = size
+        dialog = QDialog(self)
+        dialog.setWindowTitle(DOWNSCALE_DIALOG_TITLE)
+        dialog.setMinimumWidth(460)
+
+        size_text = "после обрезки" if cropped else "изображения"
+        message_lines = [
+            f"{record.display_name}: размер {size_text} — {width}×{height} px.",
+            "Понизить разрешение перед сохранением? Пропорции сохраняются.",
+        ]
+        if is_large_image(size):
+            threshold_width, threshold_height = LARGE_IMAGE_THRESHOLD
+            message_lines.append(
+                f"Разрешение от {threshold_width}×{threshold_height}: "
+                "обработка такого изображения может быть медленной."
             )
-            temp_path.replace(image_path)
-        except (OSError, ValueError):
-            try:
-                temp_path.unlink()
-            except FileNotFoundError:
-                pass
-            raise
+        message_label = QLabel("\n\n".join(message_lines), dialog)
+        message_label.setWordWrap(True)
+
+        # По умолчанию разрешение сохраняется: уменьшение — только явный выбор.
+        original_button = QRadioButton(
+            f"{KEEP_RESOLUTION_TEXT} ({width}×{height})", dialog
+        )
+        original_button.setChecked(True)
+        preset_buttons: list[tuple[QRadioButton, DownscalePreset | None]] = [
+            (original_button, None)
+        ]
+        for preset, (target_width, target_height) in reducing_presets(size):
+            recommended = (
+                " — рекомендуется"
+                if preset is DOWNSCALE_PRESETS[RECOMMENDED_PRESET_INDEX]
+                and is_large_image(size)
+                else ""
+            )
+            button = QRadioButton(
+                f"{preset.label} → {target_width}×{target_height}{recommended}",
+                dialog,
+            )
+            preset_buttons.append((button, preset))
+
+        note_label = QLabel(
+            "При уменьшении файл изображения в папке проекта будет перезаписан.",
+            dialog,
+        )
+        note_label.setWordWrap(True)
+        note_label.setStyleSheet("color: #5f6b7a;")
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok, dialog)
+        button_box.button(QDialogButtonBox.Ok).setText("Продолжить")
+        button_box.accepted.connect(dialog.accept)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        layout.addWidget(message_label)
+        for button, _preset in preset_buttons:
+            layout.addWidget(button)
+        layout.addWidget(note_label)
+        layout.addWidget(button_box)
+
+        try:
+            # Закрытие окна или Esc означают отказ от уменьшения, а не отмену обрезки.
+            if dialog.exec_() != QDialog.Accepted:
+                return None
+            for button, preset in preset_buttons:
+                if button.isChecked():
+                    return preset
+            return None
+        finally:
+            dialog.deleteLater()
+
+    def _mark_crop_reviewed(self, record: ProjectImageRecord) -> None:
+        if record.crop_reviewed:
+            return
+        record.crop_reviewed = True
+        self._schedule_project_save()
+
+    def _schedule_crop_prompt(self, record_id: str) -> None:
+        # Диалог откладывается до следующего прохода цикла событий, чтобы выбор
+        # в списке и загрузка кадра завершились до модального окна.
+        QTimer.singleShot(0, lambda: self._maybe_prompt_crop(record_id))
+
+    def _maybe_prompt_crop(self, record_id: str) -> None:
+        record = self._current_project_image()
+        if (
+            record is None
+            or record.id != record_id
+            or record.crop_reviewed
+            or self._crop_dialog_open
+            or not self.canvas.has_image()
+            or QApplication.activeModalWidget() is not None
+        ):
+            return
+        self.crop_current_image(initial=True)
 
     def start_scale_calibration(self) -> None:
         if self._selected_project_image() is None or not self.canvas.has_image():
@@ -4307,11 +5126,15 @@ class MainWindow(QMainWindow):
             return
 
         self._current_annotation_path = annotation_path
+        self._clear_histograms(HISTOGRAM_MANUAL_REFRESH_TEXT)
         self.statusBar().showMessage(f"Аннотация открыта: {annotation_path.name}")
 
     def _set_project(self, project_path: Path, document: ProjectDocument) -> None:
+        self._cancel_background_image_tasks()
         self.project_path = project_path.resolve()
         self.project_document = document
+        self._project_mean_color_stats_cache = None
+        self._project_color_sums_cache = {}
         project_name_was_synced = self._sync_project_document_name_with_path()
         self._current_project_image_id = None
         self._current_annotation_path = None
@@ -4338,6 +5161,9 @@ class MainWindow(QMainWindow):
 
     def _clear_project_state(self) -> None:
         self._project_autosave_timer.stop()
+        self._cancel_background_image_tasks()
+        self._project_mean_color_stats_cache = None
+        self._project_color_sums_cache = {}
         self.project_document = None
         self.project_path = None
         self._current_project_image_id = None
@@ -4348,6 +5174,7 @@ class MainWindow(QMainWindow):
         self._update_window_title()
 
     def _clear_current_image_display(self) -> None:
+        self._cancel_contour_detection()
         self._loading_project_image = True
         try:
             self.canvas.clear_image()
@@ -4465,6 +5292,8 @@ class MainWindow(QMainWindow):
     def _load_project_image(self, record: ProjectImageRecord) -> None:
         image_path = self._project_image_path(record)
         self._invalidate_current_contour_analysis()
+        # Контур, найденный для предыдущего фото, к новому не применяется.
+        self._cancel_contour_detection()
         self._loading_project_image = True
         size_changed = False
         loaded_ok = False
@@ -4552,16 +5381,19 @@ class MainWindow(QMainWindow):
         if size_changed:
             self._schedule_project_save()
         if loaded_ok:
-            self._refresh_histograms()
+            self._clear_histograms(HISTOGRAM_MANUAL_REFRESH_TEXT)
         self._update_current_project_list_item(record)
         self._update_project_summary_properties()
         self._update_project_properties()
         self._update_action_states()
         self._update_window_title()
+        if loaded_ok and not record.crop_reviewed:
+            self._schedule_crop_prompt(record.id)
 
     def _handle_contour_geometry_changed(self) -> None:
         if self._loading_project_image:
             return
+        self._update_analysis_status()
         self._save_current_project_annotation()
         if self._should_defer_project_summary_refresh():
             self._schedule_project_summary_refresh()
@@ -4749,11 +5581,16 @@ class MainWindow(QMainWindow):
         self.project_image_count.setText(str(len(self.project_document.images)))
         color_stats = self._project_contours_mean_color_stats()
         if color_stats is None:
-            red_text = green_text = blue_text = "-"
-            lab_l_text = lab_a_text = lab_b_text = "-"
-            hsv_h_text = hsv_s_text = hsv_v_text = "-"
-            yuv_y_text = yuv_u_text = yuv_v_text = "-"
-            lms_l_text = lms_m_text = lms_s_text = "-"
+            placeholder = (
+                CONTOUR_ANALYSIS_PENDING_TEXT
+                if self._pending_project_color_stats is not None
+                else "-"
+            )
+            red_text = green_text = blue_text = placeholder
+            lab_l_text = lab_a_text = lab_b_text = placeholder
+            hsv_h_text = hsv_s_text = hsv_v_text = placeholder
+            yuv_y_text = yuv_u_text = yuv_v_text = placeholder
+            lms_l_text = lms_m_text = lms_s_text = placeholder
         else:
             mean_rgb, mean_lab, mean_hsv, mean_yuv, mean_lms = color_stats
             red, green, blue = mean_rgb
@@ -4837,89 +5674,189 @@ class MainWindow(QMainWindow):
         finally:
             self._updating_project_identity_fields = False
 
-    def _project_contours_mean_color_stats(
-        self,
-    ) -> (
-        tuple[
-            tuple[int, int, int],
-            tuple[int, int, int],
-            tuple[int, int, int],
-            tuple[int, int, int],
-            tuple[int, int, int],
-        ]
-        | None
-    ):
+    def _project_contours_mean_color_stats(self) -> ProjectMeanColorStats | None:
         if self.project_document is None:
             return None
+        if not self._analysis_refresh_allowed:
+            return self._project_mean_color_stats_cache
 
-        rgb_total = np.zeros(3, dtype=np.float64)
-        lab_total = np.zeros(3, dtype=np.float64)
-        hsv_total = np.zeros(3, dtype=np.float64)
-        yuv_total = np.zeros(3, dtype=np.float64)
-        lms_total = np.zeros(3, dtype=np.float64)
-        lms_max = np.zeros(3, dtype=np.float64)
-        pixel_count = 0
+        entries = self._project_color_stats_entries()
+        missing = [
+            entry
+            for entry in entries
+            if entry.cache_key not in self._project_color_sums_cache
+        ]
+        missing_pixels = sum(
+            entry.expected_size[0] * entry.expected_size[1] for entry in missing
+        )
+        if missing_pixels > CONTOUR_ANALYSIS_SYNC_PIXEL_LIMIT:
+            # Большой объём: считаем в фоне с прогрессом, а в полях проекта
+            # пока показываем «расчёт...».
+            self._start_project_color_stats(entries, missing)
+            return None
+
+        # Небольшой объём (или всё уже в кэше) быстрее досчитать сразу.
+        self._cancel_project_color_stats()
+        for entry in missing:
+            self._project_color_sums_cache[entry.cache_key] = (
+                compute_project_color_sums(entry)
+            )
+        return self._store_project_mean_color_stats(entries)
+
+    def _project_color_stats_entries(self) -> list[ProjectColorStatsEntry]:
+        if self.project_document is None:
+            return []
+        entries: list[ProjectColorStatsEntry] = []
         for record in self.project_document.images:
             if record.annotation is None or record.annotation_error:
                 continue
-
             image_path = self._project_image_path(record)
-            if not image_path.exists():
-                continue
-
             try:
-                loaded_image = load_raster_image(image_path)
-            except (OSError, ValueError):
+                file_stat = image_path.stat()
+            except OSError:
                 continue
+            points = list(record.annotation.points)
+            entries.append(
+                ProjectColorStatsEntry(
+                    cache_key=(
+                        str(image_path),
+                        file_stat.st_mtime_ns,
+                        file_stat.st_size,
+                        contour_signature(points),
+                    ),
+                    image_path=image_path,
+                    points=points,
+                    expected_size=(
+                        int(record.annotation.image_width),
+                        int(record.annotation.image_height),
+                    ),
+                )
+            )
+        return entries
 
-            if (record.annotation.image_width, record.annotation.image_height) != (
-                loaded_image.width,
-                loaded_image.height,
-            ):
-                continue
-
-            pixels = _annotation_rgb_pixels(loaded_image.rgb_array, record.annotation)
-            if pixels.size == 0:
-                continue
-
-            rgb_total += pixels.sum(axis=0)
-            lab_total += _lab_values_from_rgb_pixels(pixels).sum(axis=0)
-            hsv_total += _hsv_values_from_rgb_pixels(pixels).sum(axis=0)
-            yuv_total += _yuv_values_from_rgb_pixels(pixels).sum(axis=0)
-            lms_values = rgb_to_lms(pixels)
-            lms_total += lms_values.sum(axis=0)
-            lms_max = np.maximum(lms_max, lms_values.max(axis=0))
-            pixel_count += int(pixels.shape[0])
-
-        if pixel_count == 0:
+    def _store_project_mean_color_stats(
+        self, entries: list[ProjectColorStatsEntry]
+    ) -> ProjectMeanColorStats | None:
+        # Кэш хранит только записи текущих изображений и контуров, чтобы
+        # он не рос при каждом редактировании контура.
+        cache = self._project_color_sums_cache
+        self._project_color_sums_cache = {
+            entry.cache_key: cache[entry.cache_key]
+            for entry in entries
+            if entry.cache_key in cache
+        }
+        combined = combine_color_sums(
+            sums for sums in self._project_color_sums_cache.values() if sums is not None
+        )
+        if combined is None:
+            self._project_mean_color_stats_cache = None
             return None
+        stats = color_stats_from_sums(combined)
+        self._project_mean_color_stats_cache = (
+            stats.mean_rgb,
+            stats.mean_lab,
+            stats.mean_hsv,
+            stats.mean_yuv,
+            stats.mean_lms,
+        )
+        return self._project_mean_color_stats_cache
 
-        mean_rgb_values = np.rint(rgb_total / pixel_count).astype(int)
-        mean_lab_values = np.rint(lab_total / pixel_count).astype(int)
-        mean_hsv_values = np.rint(hsv_total / pixel_count).astype(int)
-        mean_yuv_values = np.rint(yuv_total / pixel_count).astype(int)
-        mean_lms_values = _mean_lms_values_from_total(lms_total, lms_max, pixel_count)
-        mean_rgb = (
-            int(mean_rgb_values[0]),
-            int(mean_rgb_values[1]),
-            int(mean_rgb_values[2]),
+    def _start_project_color_stats(
+        self,
+        entries: list[ProjectColorStatsEntry],
+        missing: list[ProjectColorStatsEntry],
+    ) -> None:
+        self._cancel_project_color_stats()
+        self._project_color_stats_request_id += 1
+        request_id = self._project_color_stats_request_id
+        cancel_event = threading.Event()
+        self._pending_project_color_stats = PendingProjectColorStats(
+            request_id=request_id,
+            entries=entries,
+            cancel_event=cancel_event,
         )
-        mean_lab = (
-            int(mean_lab_values[0]),
-            int(mean_lab_values[1]),
-            int(mean_lab_values[2]),
-        )
-        mean_hsv = (
-            int(mean_hsv_values[0]),
-            int(mean_hsv_values[1]),
-            int(mean_hsv_values[2]),
-        )
-        mean_yuv = (
-            int(mean_yuv_values[0]),
-            int(mean_yuv_values[1]),
-            int(mean_yuv_values[2]),
-        )
-        return mean_rgb, mean_lab, mean_hsv, mean_yuv, mean_lms_values
+        # В поток уходят только изображения без записи в кэше.
+        worker = _ProjectColorStatsWorker(request_id, missing, cancel_event)
+        worker.signals.progress.connect(self._handle_project_color_stats_progress)
+        worker.signals.finished.connect(self._handle_project_color_stats_finished)
+        worker.signals.failed.connect(self._handle_project_color_stats_failed)
+        self._project_color_stats_workers[request_id] = worker
+        self._begin_busy("Расчёт статистики проекта…", maximum=len(missing))
+        self._project_color_stats_thread_pool.start(worker)
+
+    def _handle_project_color_stats_progress(
+        self, request_id: int, done: int, total: int
+    ) -> None:
+        pending = self._pending_project_color_stats
+        if pending is None or pending.request_id != request_id:
+            return
+        self._set_busy_progress(done, total)
+        self.statusBar().showMessage(f"Расчёт статистики проекта: {done} из {total}")
+
+    def _handle_project_color_stats_finished(
+        self,
+        request_id: int,
+        results: dict[ProjectColorSumsCacheKey, ContourColorSums | None],
+    ) -> None:
+        self._project_color_stats_workers.pop(request_id, None)
+        pending = self._pending_project_color_stats
+        if pending is None or pending.request_id != request_id:
+            return
+        self._pending_project_color_stats = None
+        self._end_busy()
+        self._project_color_sums_cache.update(results)
+        # Статистика соответствует моменту нажатия «Обновить», как и гистограммы.
+        self._store_project_mean_color_stats(pending.entries)
+        self._update_project_summary_properties()
+        self.statusBar().showMessage("Статистика проекта обновлена.")
+
+    def _handle_project_color_stats_failed(self, request_id: int, message: str) -> None:
+        self._project_color_stats_workers.pop(request_id, None)
+        pending = self._pending_project_color_stats
+        if pending is None or pending.request_id != request_id:
+            return
+        self._pending_project_color_stats = None
+        self._end_busy()
+        self._update_project_summary_properties()
+        if message and message != IMAGE_PREPARE_CANCELLED_TEXT:
+            self.statusBar().showMessage(
+                f"Не удалось рассчитать статистику проекта: {message}"
+            )
+
+    def _cancel_project_color_stats(self) -> None:
+        pending = self._pending_project_color_stats
+        if pending is None:
+            return
+        pending.cancel_event.set()
+        self._project_color_stats_request_id += 1
+        self._pending_project_color_stats = None
+        self._end_busy()
+
+    def _begin_busy(self, message: str, maximum: int = 0) -> None:
+        # maximum=0 включает «бегущую» полосу для задач без измеримого прогресса.
+        self._busy_task_count += 1
+        self.busy_progress.setRange(0, maximum)
+        self.busy_progress.setValue(0)
+        self.busy_progress.show()
+        self.statusBar().showMessage(message)
+
+    def _set_busy_progress(self, value: int, maximum: int) -> None:
+        self.busy_progress.setRange(0, maximum)
+        self.busy_progress.setValue(value)
+
+    def _end_busy(self) -> None:
+        self._busy_task_count = max(0, self._busy_task_count - 1)
+        if self._busy_task_count == 0:
+            self.busy_progress.hide()
+
+    def _cancel_background_image_tasks(self) -> None:
+        self._cancel_contour_detection()
+        self._cancel_project_color_stats()
+        if self._pending_flatten_background is not None:
+            # Запись файла атомарная; результат для закрытого проекта просто не применяется.
+            self._flatten_background_request_id += 1
+            self._pending_flatten_background = None
+            self._end_busy()
 
     def _update_project_properties(self, *_args) -> None:
         record = self._selected_project_image()
@@ -4966,12 +5903,19 @@ class MainWindow(QMainWindow):
             calibration_scale_text = _calibration_scale_text(record.calibration)
 
         contour_stats = self._current_contour_stats(record)
-        contour_analysis_pending = (
+        analysis_is_current_record = (
             contour_stats is None
             and record.id == self._current_project_image_id
             and self.canvas.has_image()
             and self.canvas.has_contour()
+        )
+        contour_analysis_pending = (
+            analysis_is_current_record
             and self._is_current_contour_analysis_pending(record)
+        )
+        contour_analysis_outdated = (
+            analysis_is_current_record
+            and self._is_current_contour_analysis_outdated(record)
         )
         if contour_stats is None:
             red_text = green_text = blue_text = "-"
@@ -4981,14 +5925,19 @@ class MainWindow(QMainWindow):
             lms_l_text = lms_m_text = lms_s_text = "-"
             contour_pixels_text = "-"
             contour_area_mm2_text = "-"
+            placeholder = ""
             if contour_analysis_pending:
-                red_text = green_text = blue_text = CONTOUR_ANALYSIS_PENDING_TEXT
-                lab_l_text = lab_a_text = lab_b_text = CONTOUR_ANALYSIS_PENDING_TEXT
-                hsv_h_text = hsv_s_text = hsv_v_text = CONTOUR_ANALYSIS_PENDING_TEXT
-                yuv_y_text = yuv_u_text = yuv_v_text = CONTOUR_ANALYSIS_PENDING_TEXT
-                lms_l_text = lms_m_text = lms_s_text = CONTOUR_ANALYSIS_PENDING_TEXT
-                contour_pixels_text = CONTOUR_ANALYSIS_PENDING_TEXT
-                contour_area_mm2_text = CONTOUR_ANALYSIS_PENDING_TEXT
+                placeholder = CONTOUR_ANALYSIS_PENDING_TEXT
+            elif contour_analysis_outdated:
+                placeholder = CONTOUR_ANALYSIS_OUTDATED_TEXT
+            if placeholder:
+                red_text = green_text = blue_text = placeholder
+                lab_l_text = lab_a_text = lab_b_text = placeholder
+                hsv_h_text = hsv_s_text = hsv_v_text = placeholder
+                yuv_y_text = yuv_u_text = yuv_v_text = placeholder
+                lms_l_text = lms_m_text = lms_s_text = placeholder
+                contour_pixels_text = placeholder
+                contour_area_mm2_text = placeholder
             mean_rgb = None
         else:
             mean_rgb, mean_lab, mean_hsv, mean_yuv, mean_lms, contour_pixel_count = (
@@ -5694,6 +6643,7 @@ class MainWindow(QMainWindow):
         self._store_current_segment_measurements()
         self._save_current_project_annotation()
         if self._save_project_silently(show_error=True):
+            self._shutdown_background_tasks()
             event.accept()
             return
 
@@ -5705,9 +6655,28 @@ class MainWindow(QMainWindow):
             QMessageBox.No,
         )
         if answer == QMessageBox.Yes:
+            self._shutdown_background_tasks()
             event.accept()
         else:
             event.ignore()
+
+    def _shutdown_background_tasks(self) -> None:
+        self._cancel_background_image_tasks()
+        # Даём потокам закончить текущий шаг, чтобы они не отправляли сигналы
+        # в уже разрушенное окно. Ожидание ограничено по времени.
+        pools = {
+            id(pool): pool
+            for pool in (
+                self._contour_analysis_thread_pool,
+                self._contour_detection_thread_pool,
+                self._project_color_stats_thread_pool,
+                self._flatten_background_thread_pool,
+                self._image_prepare_thread_pool,
+            )
+            if isinstance(pool, QThreadPool)
+        }
+        for pool in pools.values():
+            pool.waitForDone(BACKGROUND_TASK_SHUTDOWN_TIMEOUT_MS)
 
     def _show_warning(self, title: str, message: str) -> None:
         QMessageBox.warning(self, title, message)
@@ -6109,6 +7078,18 @@ def _circle_contour_points(width: int, height: int, node_count: int) -> list[Poi
     return points
 
 
+def _image_processed_status(
+    *, cropped: bool, downscaled: bool, size: tuple[int, int]
+) -> str:
+    if cropped and downscaled:
+        action = "Изображение обрезано и уменьшено"
+    elif cropped:
+        action = "Изображение обрезано"
+    else:
+        action = "Разрешение изображения понижено"
+    return f"{action}: {size[0]}×{size[1]}"
+
+
 def _current_timestamp() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -6215,13 +7196,17 @@ def _project_relative_path_key(value: str) -> str:
     return str(value or "").replace("\\", "/").strip("/")
 
 
-def _unique_destination_path(directory: Path, file_name: str) -> Path:
+def _unique_destination_path(
+    directory: Path, file_name: str, *, reserved: set[Path] | None = None
+) -> Path:
     source_name = Path(file_name).name
     stem = Path(source_name).stem or "image"
     suffix = Path(source_name).suffix
     candidate = directory / source_name
     index = 1
-    while candidate.exists():
+    while candidate.exists() or (reserved is not None and candidate in reserved):
         candidate = directory / f"{stem}_{index}{suffix}"
         index += 1
+    if reserved is not None:
+        reserved.add(candidate)
     return candidate

@@ -94,6 +94,11 @@ ACTION_VISUALS: dict[str, ActionVisual] = {
         tool_tip="Масштаб 100%",
         status_tip="Вернуть отображение изображения к масштабу 100%.",
     ),
+    "crop_image": ActionVisual(
+        icon_name="crop-image",
+        tool_tip="Обрезать",
+        status_tip="Выбрать область фотографии и обрезать файл изображения.",
+    ),
     "default_view": ActionVisual(
         icon_name="default-view",
         tool_tip="Вид по умолчанию",
@@ -168,6 +173,11 @@ ACTION_VISUALS: dict[str, ActionVisual] = {
         icon_name="open-annotation",
         tool_tip="Открыть аннотацию",
         status_tip="Загрузить контур из JSON-файла аннотации.",
+    ),
+    "refresh_analysis": ActionVisual(
+        icon_name="refresh-analysis",
+        tool_tip="Обновить",
+        status_tip="Пересчитать гистограммы и аналитику по загруженным изображениям.",
     ),
     "about": ActionVisual(
         icon_name="about",
