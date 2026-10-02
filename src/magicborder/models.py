@@ -335,6 +335,27 @@ class ProjectImageMeasurements:
         )
 
 
+def _exclusions_from_payload(data: Any) -> list[list[Point]]:
+    """Читает негативные выделения; повреждённые полигоны пропускаются.
+
+    Ошибка в одном исключении не должна делать нечитаемым весь главный контур.
+    """
+    if not isinstance(data, list):
+        return []
+    exclusions: list[list[Point]] = []
+    for item in data:
+        raw_points = item.get("points") if isinstance(item, dict) else None
+        if not isinstance(raw_points, list):
+            continue
+        try:
+            polygon = [Point.from_dict(point) for point in raw_points]
+        except ValueError:
+            continue
+        if len(polygon) >= 3:
+            exclusions.append(polygon)
+    return exclusions
+
+
 @dataclass(slots=True)
 class Annotation:
     image_path: str
@@ -344,6 +365,9 @@ class Annotation:
     closed: bool = True
     version: int = 1
     line_color: str = CONTOUR_LINE_COLOR
+    # Негативные выделения: полигоны внутри контура, пиксели которых
+    # не участвуют в расчётах.
+    exclusions: list[list[Point]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.image_width = _require_int(self.image_width, "image_width")
@@ -354,10 +378,13 @@ class Annotation:
         self.version = max(1, int(self.version))
         if len(self.points) < 3:
             raise ValueError("Контур должен содержать минимум 3 точки.")
+        self.exclusions = [
+            list(polygon) for polygon in self.exclusions or [] if len(polygon) >= 3
+        ]
 
     def to_dict(self) -> dict[str, Any]:
         self.line_color = normalize_line_color(self.line_color, CONTOUR_LINE_COLOR)
-        return {
+        payload: dict[str, Any] = {
             "version": self.version,
             "image_path": self.image_path,
             "image_size": {
@@ -368,6 +395,12 @@ class Annotation:
             "points": [point.to_dict() for point in self.points],
             "line_color": self.line_color,
         }
+        if self.exclusions:
+            payload["exclusions"] = [
+                {"points": [point.to_dict() for point in polygon]}
+                for polygon in self.exclusions
+            ]
+        return payload
 
     @classmethod
     def from_dict(cls, data: Any) -> Annotation:
@@ -392,6 +425,7 @@ class Annotation:
             closed=bool(data.get("closed", True)),
             version=int(data.get("version", 1)),
             points=[Point.from_dict(item) for item in raw_points],
+            exclusions=_exclusions_from_payload(data.get("exclusions")),
         )
 
 
@@ -837,6 +871,8 @@ class ProjectImageRecord:
     def from_dict(cls, data: Any) -> ProjectImageRecord:
         if not isinstance(data, dict):
             raise ValueError("Запись изображения в проекте должна быть объектом.")
+        if "file" not in data:
+            return cls._from_legacy_dict(data)
 
         calibration_payload = data.get("calibration")
         calibration = None
@@ -874,6 +910,39 @@ class ProjectImageRecord:
             },
         )
 
+    @classmethod
+    def _from_legacy_dict(cls, data: dict[str, Any]) -> ProjectImageRecord:
+        """Запись формата версии 1: без групп, все поля на верхнем уровне.
+
+        Раньше такие записи отбрасывались, и старый проект открывался пустым.
+        """
+        relative_path = _normalize_project_path(
+            data.get("path", data.get("relative_path", ""))
+        )
+        image_size = data.get("image_size", {})
+        if not isinstance(image_size, dict):
+            image_size = {}
+        metadata = data.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        migrated_metadata = dict(metadata)
+        for key in (*PROJECT_IMAGE_METADATA_DEFAULTS, "sample_id"):
+            if key in data and key not in migrated_metadata:
+                migrated_metadata[key] = data[key]
+        legacy_sample_id = str(metadata.get("sample_id", "")).strip()
+
+        return cls(
+            id=str(data.get("id") or legacy_sample_id or relative_path),
+            relative_path=relative_path,
+            display_name=str(data.get("display_name") or ""),
+            image_width=image_size.get("width", data.get("image_width")),
+            image_height=image_size.get("height", data.get("image_height")),
+            contour=ProjectImageContourInfo.from_dict(
+                {"annotation": data.get("annotation")}
+            ),
+            metadata=migrated_metadata,
+        )
+
 
 @dataclass(slots=True)
 class ProjectDocument:
@@ -882,6 +951,9 @@ class ProjectDocument:
     version: int = PROJECT_FORMAT_VERSION
     images_dir: str = "images"
     project_info: ProjectInfo = field(default_factory=ProjectInfo)
+    # Записи, которые не удалось прочитать. Они записываются обратно как есть,
+    # чтобы автосохранение не стёрло данные из файла проекта.
+    unreadable_images: list[Any] = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
         self.name = str(self.name or "project").strip() or "project"
@@ -898,7 +970,10 @@ class ProjectDocument:
             "name": self.name,
             "images_dir": self.images_dir,
             "project_info": self.project_info.to_dict(),
-            "images": [record.to_dict() for record in self.images],
+            "images": [
+                *(record.to_dict() for record in self.images),
+                *self.unreadable_images,
+            ],
         }
 
     @classmethod
@@ -911,17 +986,24 @@ class ProjectDocument:
             raise ValueError("Поле 'images' должно содержать список изображений.")
 
         images: list[ProjectImageRecord] = []
+        unreadable_images: list[Any] = []
         for item in raw_images:
             try:
                 images.append(ProjectImageRecord.from_dict(item))
             except ValueError:
-                continue
+                unreadable_images.append(item)
 
+        # Записи версии 1 уже переведены в текущую структуру, поэтому
+        # при сохранении файл получает актуальный номер формата.
+        version = max(
+            _optional_positive_int(data.get("version")) or PROJECT_FORMAT_VERSION,
+            PROJECT_FORMAT_VERSION,
+        )
         return cls(
             name=str(data.get("name") or data.get("project_name") or "project"),
-            version=_optional_positive_int(data.get("version"))
-            or PROJECT_FORMAT_VERSION,
+            version=version,
             images_dir=str(data.get("images_dir") or "images"),
             project_info=ProjectInfo.from_dict(data.get("project_info", {})),
             images=images,
+            unreadable_images=unreadable_images,
         )

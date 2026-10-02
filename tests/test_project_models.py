@@ -728,7 +728,7 @@ class ProjectModelsTest(unittest.TestCase):
         self.assertEqual(metadata["diagnosis"], "Не указано")
         self.assertEqual(metadata["notes"], "")
 
-    def test_old_flat_project_records_are_not_migrated(self) -> None:
+    def test_old_flat_project_records_are_migrated(self) -> None:
         project = ProjectDocument.from_dict(
             {
                 "name": "old",
@@ -742,7 +742,9 @@ class ProjectModelsTest(unittest.TestCase):
             }
         )
 
-        self.assertEqual(project.images, [])
+        self.assertEqual([record.id for record in project.images], ["record-id"])
+        self.assertEqual(project.images[0].relative_path, "images/leaf.png")
+        self.assertEqual(project.images[0].display_name, "leaf.png")
 
 
 if __name__ == "__main__":

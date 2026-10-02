@@ -59,6 +59,7 @@ from PyQt5.QtWidgets import (
 from .canvas import ImageCanvas
 from .contour_analysis import (
     ContourAnalysis,
+    ContourColorStats,
     ContourColorSums,
     ContourSignature,
     build_contour_analysis,
@@ -113,6 +114,7 @@ from .models import (
     ANGLE_LABEL_COLOR,
     ANGLE_LINE_COLOR,
     CONTOUR_LINE_COLOR,
+    PROJECT_IMAGE_METADATA_DEFAULTS,
     SEGMENT_LABEL_COLOR,
     SEGMENT_LINE_COLOR,
     Annotation,
@@ -200,6 +202,7 @@ class _ContourAnalysisWorker(QRunnable):
         signature: ContourSignature,
         rgb_array: np.ndarray,
         points: list[Point],
+        exclusions: list[list[Point]] | None = None,
     ) -> None:
         super().__init__()
         self.signals = _ContourAnalysisWorkerSignals()
@@ -209,10 +212,13 @@ class _ContourAnalysisWorker(QRunnable):
         self._signature = signature
         self._rgb_array = rgb_array
         self._points = points
+        self._exclusions = exclusions or []
 
     def run(self) -> None:
         try:
-            analysis = build_contour_analysis(self._rgb_array, self._points)
+            analysis = build_contour_analysis(
+                self._rgb_array, self._points, self._exclusions
+            )
         except (
             Exception
         ) as exc:  # pragma: no cover - defensive boundary for worker failures
@@ -337,6 +343,7 @@ class ProjectColorStatsEntry:
     image_path: Path
     points: list[Point]
     expected_size: tuple[int, int]
+    exclusions: tuple[list[Point], ...] = ()
 
 
 def compute_project_color_sums(
@@ -351,7 +358,7 @@ def compute_project_color_sums(
     height, width = rgb_array.shape[:2]
     if (width, height) != entry.expected_size:
         return None
-    return contour_color_sums(rgb_array, entry.points)
+    return contour_color_sums(rgb_array, entry.points, entry.exclusions)
 
 
 class _ProjectColorStatsWorkerSignals(QObject):
@@ -569,6 +576,29 @@ IMAGE_PROPERTY_EXPORT_KEYS = [
     field_name for field_name, _label in IMAGE_PROPERTY_EXPORT_ITEMS
 ]
 IMAGE_PROPERTY_EXPORT_LABELS = dict(IMAGE_PROPERTY_EXPORT_ITEMS)
+
+
+def _all_images_export_columns() -> list[tuple[str, str]]:
+    """Столбцы экспорта всех фотографий: те же свойства, что у одного изображения.
+
+    Подписи цветовых каналов дополняются названием пространства, потому что
+    в одной строке таблицы «L», «S» и «V» встречаются в нескольких пространствах.
+    """
+    columns: list[tuple[str, str]] = []
+    for group_title, group_items in IMAGE_PROPERTY_GROUPS:
+        prefix = ""
+        if (group_title, group_items) in IMAGE_COLOR_SPACE_PROPERTY_GROUPS:
+            prefix = f"{group_title.rsplit(' ', 1)[-1]} "
+        for field_name, label in group_items:
+            columns.append((field_name, f"{prefix}{label}"))
+            if field_name == "contour_area_mm2":
+                columns.append(("exclusion_count", "Негативных выделений"))
+                columns.append(("analysis_status", "Статус расчёта"))
+    return columns
+
+
+ALL_IMAGES_EXPORT_COLUMNS = _all_images_export_columns()
+ALL_IMAGES_AVERAGE_COLOR_LABEL = dict(ALL_IMAGES_EXPORT_COLUMNS)["average_color"]
 
 
 def _export_leaf(
@@ -877,6 +907,30 @@ class MainWindow(QMainWindow):
         title = QLabel("Свойства проекта")
         title.setObjectName("projectPanelTitle")
 
+        self.export_all_images_excel_button = QToolButton(properties_widget)
+        self.export_all_images_excel_button.setText("Все фото")
+        self.export_all_images_excel_button.setIcon(load_icon("export-all-excel"))
+        self.export_all_images_excel_button.setToolTip(
+            "Обновить данные и экспортировать все фотографии в один Excel-файл"
+        )
+        self.export_all_images_excel_button.setStatusTip(
+            "Пересчитать данные всех фотографий проекта и сохранить их "
+            "в один файл .xlsx."
+        )
+        self.export_all_images_excel_button.setToolButtonStyle(
+            Qt.ToolButtonTextBesideIcon
+        )
+        self.export_all_images_excel_button.clicked.connect(
+            self.export_all_images_excel
+        )
+
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(6)
+        header_layout.addWidget(title)
+        header_layout.addStretch(1)
+        header_layout.addWidget(self.export_all_images_excel_button)
+
         self.project_properties_empty_label = QLabel("Проект не открыт.")
         self.project_properties_empty_label.setObjectName("propertyEmpty")
         self.project_properties_empty_label.setWordWrap(True)
@@ -982,7 +1036,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(properties_widget)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
-        layout.addWidget(title)
+        layout.addLayout(header_layout)
         layout.addWidget(self.project_properties_empty_label, 1)
         layout.addWidget(self.project_properties_browser, 1)
         return properties_widget
@@ -2144,6 +2198,13 @@ class MainWindow(QMainWindow):
             self.export_image_properties_excel
         )
 
+        self.export_all_images_excel_action = QAction(
+            "Экспорт данных всех фотографий в Excel...", self
+        )
+        self.export_all_images_excel_action.triggered.connect(
+            self.export_all_images_excel
+        )
+
         self.exit_action = QAction("Выход", self)
         self.exit_action.setShortcut("Ctrl+Q")
         self.exit_action.triggered.connect(self.close)
@@ -2194,6 +2255,12 @@ class MainWindow(QMainWindow):
         self.delete_contour_action.setShortcut("Ctrl+Delete")
         self.delete_contour_action.triggered.connect(self.delete_current_contour)
 
+        self.add_exclusion_action = QAction("Негативное выделение", self)
+        self.add_exclusion_action.triggered.connect(self.add_negative_selection)
+
+        self.delete_exclusion_action = QAction("Удалить негативное выделение", self)
+        self.delete_exclusion_action.triggered.connect(self.delete_negative_selection)
+
         self.flatten_background_action = QAction("Выровнять фон", self)
         self.flatten_background_action.setShortcut("F6")
         self.flatten_background_action.triggered.connect(self.flatten_background)
@@ -2242,6 +2309,7 @@ class MainWindow(QMainWindow):
             "remove_image": self.remove_image_action,
             "export_project_excel": self.export_project_excel_action,
             "export_image_properties_excel": self.export_image_properties_excel_action,
+            "export_all_images_excel": self.export_all_images_excel_action,
             "exit": self.exit_action,
             "zoom_in": self.zoom_in_action,
             "zoom_out": self.zoom_out_action,
@@ -2254,6 +2322,8 @@ class MainWindow(QMainWindow):
             "new_contour": self.new_contour_action,
             "detect_contour": self.detect_contour_action,
             "delete_contour": self.delete_contour_action,
+            "add_exclusion": self.add_exclusion_action,
+            "delete_exclusion": self.delete_exclusion_action,
             "flatten_background": self.flatten_background_action,
             "calibrate_scale": self.calibrate_scale_action,
             "reset_calibration": self.reset_calibration_action,
@@ -2282,6 +2352,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.remove_image_action)
         file_menu.addAction(self.export_project_excel_action)
         file_menu.addAction(self.export_image_properties_excel_action)
+        file_menu.addAction(self.export_all_images_excel_action)
         file_menu.addSeparator()
         file_menu.addAction(self.exit_action)
 
@@ -2303,6 +2374,8 @@ class MainWindow(QMainWindow):
         tools_menu.addAction(self.new_contour_action)
         tools_menu.addAction(self.detect_contour_action)
         tools_menu.addAction(self.delete_contour_action)
+        tools_menu.addAction(self.add_exclusion_action)
+        tools_menu.addAction(self.delete_exclusion_action)
         tools_menu.addAction(self.flatten_background_action)
         tools_menu.addSeparator()
         tools_menu.addAction(self.calibrate_scale_action)
@@ -2339,6 +2412,7 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.remove_image_action)
         toolbar.addAction(self.export_project_excel_action)
         toolbar.addAction(self.export_image_properties_excel_action)
+        toolbar.addAction(self.export_all_images_excel_action)
         toolbar.addSeparator()
         toolbar.addAction(self.zoom_in_action)
         toolbar.addAction(self.zoom_out_action)
@@ -2355,6 +2429,8 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.new_contour_action)
         toolbar.addAction(self.detect_contour_action)
         toolbar.addAction(self.delete_contour_action)
+        toolbar.addAction(self.add_exclusion_action)
+        toolbar.addAction(self.delete_exclusion_action)
         toolbar.addAction(self.flatten_background_action)
         toolbar.addAction(self.calibrate_scale_action)
         toolbar.addAction(self.reset_calibration_action)
@@ -2397,6 +2473,9 @@ class MainWindow(QMainWindow):
         self.export_project_excel_button.setEnabled(has_project)
         self.export_image_properties_excel_action.setEnabled(has_project_image)
         self.export_image_properties_excel_button.setEnabled(has_project_image)
+        has_project_images = has_project and bool(self.project_document.images)
+        self.export_all_images_excel_action.setEnabled(has_project_images)
+        self.export_all_images_excel_button.setEnabled(has_project_images)
         self.zoom_in_action.setEnabled(has_image)
         self.zoom_out_action.setEnabled(has_image)
         self.fit_image_action.setEnabled(has_image)
@@ -2417,6 +2496,12 @@ class MainWindow(QMainWindow):
         )
         self.delete_contour_action.setEnabled(
             has_project_image and (has_contour or has_project_contour)
+        )
+        self.add_exclusion_action.setEnabled(
+            has_project_image and has_image and has_contour and not image_job_pending
+        )
+        self.delete_exclusion_action.setEnabled(
+            has_project_image and has_image and self.canvas.has_exclusions()
         )
         self.flatten_background_action.setEnabled(
             has_project_image and has_image and has_contour and not image_job_pending
@@ -2629,7 +2714,7 @@ class MainWindow(QMainWindow):
         inputs = self._current_contour_analysis_inputs(record)
         if inputs is None:
             return None
-        key, record_id, image_path, points = inputs
+        key, record_id, image_path, points, exclusions = inputs
 
         if self._contour_analysis_cache_matches(key):
             return self._contour_analysis_cache
@@ -2661,7 +2746,7 @@ class MainWindow(QMainWindow):
                 record_id=record_id,
                 image_path=image_path,
                 signature=key[2],
-                analysis=build_contour_analysis(rgb_array, points),
+                analysis=build_contour_analysis(rgb_array, points, exclusions),
             )
             self._contour_analysis_cache = result
             self._pending_contour_analysis_key = None
@@ -2677,6 +2762,7 @@ class MainWindow(QMainWindow):
             signature=key[2],
             rgb_array=rgb_array,
             points=points,
+            exclusions=exclusions,
         )
         worker.signals.finished.connect(self._handle_contour_analysis_finished)
         worker.signals.failed.connect(self._handle_contour_analysis_failed)
@@ -2697,7 +2783,16 @@ class MainWindow(QMainWindow):
     def _current_contour_analysis_inputs(
         self,
         record: ProjectImageRecord | None = None,
-    ) -> tuple[ContourAnalysisCacheKey, str | None, str | None, list[Point]] | None:
+    ) -> (
+        tuple[
+            ContourAnalysisCacheKey,
+            str | None,
+            str | None,
+            list[Point],
+            list[list[Point]],
+        ]
+        | None
+    ):
         if not self.canvas.has_image() or not self.canvas.has_contour():
             return None
 
@@ -2705,12 +2800,14 @@ class MainWindow(QMainWindow):
         image_path = self.canvas.current_image_path()
         image_path_text = str(image_path) if image_path is not None else None
         points = self.canvas.contour_points()
-        signature = contour_signature(points)
+        exclusions = self.canvas.exclusion_polygons()
+        signature = contour_signature(points, exclusions)
         return (
             (record_id, image_path_text, signature),
             record_id,
             image_path_text,
             points,
+            exclusions,
         )
 
     def _contour_analysis_cache_matches(self, key: ContourAnalysisCacheKey) -> bool:
@@ -2876,6 +2973,13 @@ class MainWindow(QMainWindow):
 
         self._set_project(project_path, document)
         self.statusBar().showMessage(f"Открыт проект: {document.name}")
+        if document.unreadable_images:
+            self._show_warning(
+                "Не все изображения прочитаны",
+                f"Не удалось прочитать записей изображений: "
+                f"{len(document.unreadable_images)}. Они не показаны в списке, "
+                "но сохранены в файле проекта без изменений.",
+            )
 
     def save_project_file(self) -> None:
         if self.project_document is None:
@@ -3955,6 +4059,339 @@ class MainWindow(QMainWindow):
         row["contour_pixel_count"] = str(int(rgb_pixels.shape[0]))
         return row
 
+    def export_all_images_excel(self) -> None:
+        """Одной командой обновляет данные всех фотографий и сохраняет их в один .xlsx.
+
+        Заменяет «Обновить» + «Экспорт свойств изображения в Excel» для каждой
+        фотографии по отдельности: расчёт идёт по файлам и контурам проекта
+        (с учётом негативных выделений) без переключения фото на канвасе.
+        Одна строка таблицы — одна фотография.
+        """
+        if self.project_document is None or self.project_path is None:
+            self._show_warning("Нет проекта", "Сначала создайте или откройте проект.")
+            return
+        if not self.project_document.images:
+            self._show_warning(
+                "Нет изображений", "Сначала добавьте изображения в проект."
+            )
+            return
+
+        self._store_current_angle_measurements()
+        self._store_current_segment_measurements()
+        self._save_current_project_annotation()
+
+        file_name, _ = QFileDialog.getSaveFileName(
+            self,
+            "Экспорт данных всех фотографий в Excel",
+            str(
+                self.project_path.with_name(f"{self.project_path.stem}_all_images.xlsx")
+            ),
+            "Excel (*.xlsx);;All files (*)",
+        )
+        if not file_name:
+            return
+        output_path = _ensure_xlsx_suffix(Path(file_name))
+
+        color_sums = self._refresh_all_images_color_sums()
+        if color_sums is None:
+            self.statusBar().showMessage("Экспорт данных всех фотографий отменён.")
+            return
+
+        fieldnames, rows, cell_fills = self._all_images_export_table(color_sums)
+        try:
+            write_xlsx_table(
+                output_path,
+                fieldnames,
+                rows,
+                sheet_name="Все фотографии",
+                cell_fills=cell_fills,
+            )
+        except OSError as exc:
+            self._show_error(
+                "Ошибка экспорта данных всех фотографий в Excel",
+                f"Не удалось сохранить Excel-файл: {exc}",
+            )
+            return
+
+        # Панель свойств и графики текущей фотографии тоже приводятся
+        # в актуальное состояние, как после кнопки «Обновить».
+        self.refresh_analysis()
+        self.statusBar().showMessage(
+            f"Экспорт данных всех фотографий в Excel выполнен: {output_path.name} "
+            f"(фотографий: {len(rows)})"
+        )
+
+    def _refresh_all_images_color_sums(
+        self,
+    ) -> dict[str, ContourColorSums | None] | None:
+        """Пересчитывает цветовые суммы всех фото; None, если пользователь отменил.
+
+        Результат хранится в кэше статистики проекта: ключ включает mtime файла
+        и сигнатуру контура с исключениями, поэтому устаревшие значения
+        не используются. Недостающие считаются в фоне с индикатором прогресса.
+        """
+        if self.project_document is None:
+            return {}
+
+        entries_by_record_id = {
+            record.id: self._project_color_stats_entry(record)
+            for record in self.project_document.images
+        }
+        missing = [
+            entry
+            for entry in entries_by_record_id.values()
+            if entry is not None
+            and entry.cache_key not in self._project_color_sums_cache
+        ]
+        if missing:
+            results = self._run_export_color_sums_worker(missing)
+            if results is None:
+                return None
+            self._project_color_sums_cache.update(results)
+
+        return {
+            record_id: (
+                self._project_color_sums_cache.get(entry.cache_key)
+                if entry is not None
+                else None
+            )
+            for record_id, entry in entries_by_record_id.items()
+        }
+
+    def _run_export_color_sums_worker(
+        self, entries: list[ProjectColorStatsEntry]
+    ) -> dict[ProjectColorSumsCacheKey, ContourColorSums | None] | None:
+        """Считает суммы в пуле потоков, не блокируя цикл событий Qt."""
+        outcome: dict[str, object] = {}
+        cancel_event = threading.Event()
+        loop = QEventLoop(self)
+
+        progress = QProgressDialog(
+            "Обновление данных фотографий…", "Отмена", 0, len(entries), self
+        )
+        progress.setWindowTitle("Экспорт данных всех фотографий")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(IMAGE_PREPARE_PROGRESS_DELAY_MS)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        progress.canceled.connect(cancel_event.set)
+
+        def handle_progress(_request_id: int, done: int, _total: int) -> None:
+            progress.setValue(done)
+
+        def handle_finished(_request_id: int, results: object) -> None:
+            outcome["results"] = results
+            loop.quit()
+
+        def handle_failed(_request_id: int, message: str) -> None:
+            outcome["error"] = message
+            loop.quit()
+
+        worker = _ProjectColorStatsWorker(0, entries, cancel_event)
+        worker.signals.progress.connect(handle_progress)
+        worker.signals.finished.connect(handle_finished)
+        worker.signals.failed.connect(handle_failed)
+        self._project_color_stats_thread_pool.start(worker)
+
+        QApplication.setOverrideCursor(Qt.BusyCursor)
+        try:
+            loop.exec_()
+        finally:
+            QApplication.restoreOverrideCursor()
+            progress.canceled.disconnect()
+            progress.close()
+            progress.deleteLater()
+
+        error = outcome.get("error")
+        if error is not None:
+            if error != IMAGE_PREPARE_CANCELLED_TEXT:
+                self._show_error(
+                    "Ошибка обновления данных",
+                    f"Не удалось рассчитать данные фотографий: {error}",
+                )
+            return None
+        results = outcome.get("results")
+        return results if isinstance(results, dict) else {}
+
+    def _all_images_export_table(
+        self, color_sums: dict[str, ContourColorSums | None]
+    ) -> tuple[list[str], list[dict[str, str]], dict[tuple[int, str], str]]:
+        if self.project_document is None:
+            return [], [], {}
+
+        columns = list(ALL_IMAGES_EXPORT_COLUMNS)
+        known_keys = {key for key, _label in columns}
+        used_labels = {label for _key, label in columns}
+        rows: list[dict[str, str]] = []
+        cell_fills: dict[tuple[int, str], str] = {}
+        for row_index, record in enumerate(self.project_document.images):
+            sums = color_sums.get(record.id)
+            stats = color_stats_from_sums(sums) if sums is not None else None
+            values = self._all_images_export_values(record, stats)
+
+            # Столбцы измерений добавляются по имени: одноимённые углы и отрезки
+            # разных фотографий попадают в один столбец.
+            for key, label, value in self._all_images_measurement_values(record):
+                if key not in known_keys:
+                    unique_label = label
+                    suffix = 2
+                    while unique_label in used_labels:
+                        unique_label = f"{label} ({suffix})"
+                        suffix += 1
+                    known_keys.add(key)
+                    used_labels.add(unique_label)
+                    columns.append((key, unique_label))
+                values[key] = value
+
+            rows.append(values)
+            if stats is not None:
+                cell_fills[(row_index, ALL_IMAGES_AVERAGE_COLOR_LABEL)] = _rgb_hex(
+                    stats.mean_rgb
+                )
+
+        labels = dict(columns)
+        localized_rows = [
+            {labels[key]: values.get(key, "") for key, _label in columns}
+            for values in rows
+        ]
+        return [label for _key, label in columns], localized_rows, cell_fills
+
+    def _all_images_export_values(
+        self, record: ProjectImageRecord, stats: ContourColorStats | None
+    ) -> dict[str, str]:
+        self._normalize_record_metadata(record)
+        metadata = record.metadata
+        file_exists = self._project_image_path(record).exists()
+
+        values = {
+            key: str(metadata.get(key, "")) for key in PROJECT_IMAGE_METADATA_DEFAULTS
+        }
+        values.update(
+            {
+                "id": record.id,
+                "file_name": record.display_name,
+                "relative_path": record.relative_path,
+                "size": (
+                    f"{record.image_width} x {record.image_height}"
+                    if record.image_width and record.image_height
+                    else "-"
+                ),
+                "status": "найден" if file_exists else "отсутствует",
+                "annotation": "нет",
+                "point_count": "-",
+                "exclusion_count": "0",
+                "contour_pixel_count": "-",
+                "contour_area_mm2": "-",
+            }
+        )
+
+        if record.calibration_error:
+            values["calibration_length_mm"] = "ошибка калибровки"
+            values["calibration_scale"] = f"ошибка: {record.calibration_error}"
+        elif record.calibration is None:
+            values["calibration_length_mm"] = "калибровка не произведена"
+            values["calibration_scale"] = _calibration_scale_text(None)
+        else:
+            values["calibration_length_mm"] = _calibration_length_text(
+                record.calibration.length_mm
+            )
+            values["calibration_scale"] = _calibration_scale_text(record.calibration)
+
+        if record.annotation is not None:
+            values["annotation"] = "есть"
+            values["point_count"] = str(record.point_count())
+            values["exclusion_count"] = str(len(record.annotation.exclusions))
+        elif record.annotation_error:
+            values["annotation"] = f"ошибка: {record.annotation_error}"
+
+        if not file_exists:
+            values["analysis_status"] = "файл не найден"
+        elif record.annotation is None:
+            values["analysis_status"] = (
+                "ошибка аннотации" if record.annotation_error else "нет контура"
+            )
+        elif stats is None:
+            values["analysis_status"] = (
+                "нет данных: файл не прочитан, размер не совпадает с контуром "
+                "или внутри контура нет пикселов"
+            )
+        else:
+            values["analysis_status"] = "ok"
+
+        color_keys = (
+            ("red", "green", "blue"),
+            ("lab_l", "lab_a", "lab_b"),
+            ("hsv_h", "hsv_s", "hsv_v"),
+            ("yuv_y", "yuv_u", "yuv_v"),
+            ("lms_l", "lms_m", "lms_s"),
+        )
+        if stats is None:
+            for keys in color_keys:
+                values.update(dict.fromkeys(keys, "-"))
+            values["average_color"] = "-"
+            return values
+
+        color_values = (
+            stats.mean_rgb,
+            stats.mean_lab,
+            stats.mean_hsv,
+            stats.mean_yuv,
+            stats.mean_lms,
+        )
+        for keys, triple in zip(color_keys, color_values, strict=True):
+            values.update(
+                {key: str(value) for key, value in zip(keys, triple, strict=True)}
+            )
+        values["average_color"] = _rgb_text(stats.mean_rgb)
+        values["contour_pixel_count"] = str(stats.pixel_count)
+        values["contour_area_mm2"] = _contour_area_mm2_text(
+            stats.pixel_count, record.calibration, record.calibration_error
+        )
+        return values
+
+    def _all_images_measurement_values(
+        self, record: ProjectImageRecord
+    ) -> list[tuple[str, str, str]]:
+        """Значения углов и отрезков: (ключ столбца, заголовок, значение)."""
+        exported = self._measurement_property_export_values(record)
+        columns: list[tuple[str, str, str]] = []
+        measurements = [
+            (
+                _angle_display_name(angle, index),
+                f"angle:{angle.id}",
+                "value",
+                "Значение",
+            )
+            for index, angle in enumerate(record.measurements.angles, start=1)
+        ] + [
+            (
+                _segment_display_name(segment, index),
+                f"segment:{segment.id}",
+                "length",
+                "Длина",
+            )
+            for index, segment in enumerate(record.measurements.segments, start=1)
+        ]
+        for display_name, prefix, value_key, value_label in measurements:
+            kind = prefix.split(":", 1)[0]
+            columns.append(
+                (
+                    f"measurement:{kind}:{display_name}:{value_key}",
+                    f"{display_name}: {value_label}",
+                    exported.get(f"{prefix}:{value_key}", ""),
+                )
+            )
+            if f"{prefix}:oiv_score" in exported:
+                columns.append(
+                    (
+                        f"measurement:{kind}:{display_name}:oiv_score",
+                        f"{display_name}: Оценка OIV",
+                        exported[f"{prefix}:oiv_score"],
+                    )
+                )
+        return columns
+
     def create_new_contour(self) -> None:
         if self._selected_project_image() is None or not self.canvas.has_image():
             self._show_warning(
@@ -4135,6 +4572,71 @@ class MainWindow(QMainWindow):
         self._clear_histograms("Создайте основной контур, чтобы увидеть гистограмму.")
         self._save_project_silently(show_error=True)
         self.statusBar().showMessage(f"Контур удалён: {record.display_name}")
+
+    def add_negative_selection(self) -> None:
+        """Добавляет негативное выделение: область внутри контура, исключаемую из расчётов.
+
+        Выделение создаётся окружностью в центре контура и дальше редактируется
+        так же, как контур: перетаскиванием узлов, двойным щелчком и правой кнопкой.
+        """
+        if self._selected_project_image() is None or not self.canvas.has_image():
+            self._show_warning(
+                "Нет изображения", "Сначала выберите изображение проекта."
+            )
+            return
+        if not self.canvas.has_contour():
+            self._show_warning(
+                "Нет контура",
+                "Негативное выделение вычитается из главного контура. "
+                "Сначала постройте или загрузите контур.",
+            )
+            return
+        self.canvas.cancel_angle_measurement(show_message=False)
+        self.canvas.cancel_segment_measurement(show_message=False)
+
+        node_count, accepted = QInputDialog.getInt(
+            self,
+            "Негативное выделение",
+            "Количество узлов негативного выделения:",
+            5,
+            3,
+            128,
+            1,
+        )
+        if not accepted:
+            return
+
+        points = _exclusion_start_points(self.canvas.contour_points(), node_count)
+        try:
+            self.canvas.add_exclusion(points)
+        except ValueError as exc:
+            self._show_error("Не удалось добавить негативное выделение", str(exc))
+            return
+
+        self._save_current_project_annotation()
+        self._clear_histograms(HISTOGRAM_MANUAL_REFRESH_TEXT)
+        self._update_project_properties()
+        self._update_action_states()
+
+    def delete_negative_selection(self) -> None:
+        if not self.canvas.has_exclusions():
+            self._show_warning(
+                "Нет негативных выделений",
+                "У текущего изображения нет негативных выделений.",
+            )
+            return
+        if not self.canvas.delete_selected_exclusion():
+            self._show_warning(
+                "Негативное выделение не выбрано",
+                "Щёлкните по красному узлу негативного выделения, "
+                "которое нужно удалить, и повторите команду.",
+            )
+            return
+
+        self._save_current_project_annotation()
+        self._clear_histograms(HISTOGRAM_MANUAL_REFRESH_TEXT)
+        self._update_project_properties()
+        self._update_action_states()
 
     def flatten_background(self) -> None:
         record = self._selected_project_image()
@@ -5121,6 +5623,7 @@ class MainWindow(QMainWindow):
         try:
             self.canvas.set_contour_line_color(annotation.line_color)
             self.canvas.set_contour(annotation.points)
+            self.canvas.set_exclusions(annotation.exclusions)
         except ValueError as exc:
             self._show_error("Ошибка загрузки контура", str(exc))
             return
@@ -5341,6 +5844,7 @@ class MainWindow(QMainWindow):
                                     record.annotation.line_color
                                 )
                                 self.canvas.set_contour(record.annotation.points)
+                                self.canvas.set_exclusions(record.annotation.exclusions)
                             except ValueError as exc:
                                 record.annotation_error = str(exc)
                                 self.statusBar().showMessage(
@@ -5475,6 +5979,7 @@ class MainWindow(QMainWindow):
                 points=self.canvas.contour_points(),
                 line_color=self.canvas.contour_line_color(),
                 closed=True,
+                exclusions=self.canvas.exclusion_polygons(),
             )
             record.annotation_error = None
             record.raw_annotation = None
@@ -5708,31 +6213,38 @@ class MainWindow(QMainWindow):
             return []
         entries: list[ProjectColorStatsEntry] = []
         for record in self.project_document.images:
-            if record.annotation is None or record.annotation_error:
-                continue
-            image_path = self._project_image_path(record)
-            try:
-                file_stat = image_path.stat()
-            except OSError:
-                continue
-            points = list(record.annotation.points)
-            entries.append(
-                ProjectColorStatsEntry(
-                    cache_key=(
-                        str(image_path),
-                        file_stat.st_mtime_ns,
-                        file_stat.st_size,
-                        contour_signature(points),
-                    ),
-                    image_path=image_path,
-                    points=points,
-                    expected_size=(
-                        int(record.annotation.image_width),
-                        int(record.annotation.image_height),
-                    ),
-                )
-            )
+            entry = self._project_color_stats_entry(record)
+            if entry is not None:
+                entries.append(entry)
         return entries
+
+    def _project_color_stats_entry(
+        self, record: ProjectImageRecord
+    ) -> ProjectColorStatsEntry | None:
+        if record.annotation is None or record.annotation_error:
+            return None
+        image_path = self._project_image_path(record)
+        try:
+            file_stat = image_path.stat()
+        except OSError:
+            return None
+        points = list(record.annotation.points)
+        exclusions = tuple(record.annotation.exclusions)
+        return ProjectColorStatsEntry(
+            cache_key=(
+                str(image_path),
+                file_stat.st_mtime_ns,
+                file_stat.st_size,
+                contour_signature(points, exclusions),
+            ),
+            image_path=image_path,
+            points=points,
+            expected_size=(
+                int(record.annotation.image_width),
+                int(record.annotation.image_height),
+            ),
+            exclusions=exclusions,
+        )
 
     def _store_project_mean_color_stats(
         self, entries: list[ProjectColorStatsEntry]
@@ -6595,6 +7107,7 @@ class MainWindow(QMainWindow):
             points=self.canvas.contour_points(),
             line_color=self.canvas.contour_line_color(),
             closed=True,
+            exclusions=self.canvas.exclusion_polygons(),
         )
 
     def _prepare_image_for_annotation(
@@ -7008,7 +7521,9 @@ def _compact_float(value: float, decimals: int) -> str:
 
 
 def _annotation_rgb_pixels(rgb_array: np.ndarray, annotation: Annotation) -> np.ndarray:
-    return contour_rgb_pixels_from_points(rgb_array, annotation.points)
+    return contour_rgb_pixels_from_points(
+        rgb_array, annotation.points, annotation.exclusions
+    )
 
 
 def _mean_lab_values(rgb_pixels: np.ndarray) -> tuple[int, int, int]:
@@ -7076,6 +7591,28 @@ def _circle_contour_points(width: int, height: int, node_count: int) -> list[Poi
         y = min(max(y, 0.0), image_height)
         points.append(Point(x, y))
     return points
+
+
+def _exclusion_start_points(contour: list[Point], node_count: int) -> list[Point]:
+    """Стартовая окружность негативного выделения в центре главного контура."""
+    if len(contour) < 3:
+        raise ValueError("Сначала постройте или загрузите контур.")
+    bounded_count = max(3, min(128, int(node_count)))
+    xs = [point.x for point in contour]
+    ys = [point.y for point in contour]
+    center_x = sum(xs) / len(xs)
+    center_y = sum(ys) / len(ys)
+    radius = max(2.0, 0.15 * min(max(xs) - min(xs), max(ys) - min(ys)))
+
+    return [
+        Point(
+            center_x
+            + math.cos(-math.pi / 2.0 + 2.0 * math.pi * index / bounded_count) * radius,
+            center_y
+            + math.sin(-math.pi / 2.0 + 2.0 * math.pi * index / bounded_count) * radius,
+        )
+        for index in range(bounded_count)
+    ]
 
 
 def _image_processed_status(
