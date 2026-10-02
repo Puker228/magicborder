@@ -69,6 +69,11 @@ ACTION_VISUALS: dict[str, ActionVisual] = {
         tool_tip="Экспорт свойств изображения в Excel",
         status_tip="Сохранить свойства выбранного изображения в файл .xlsx.",
     ),
+    "export_all_images_excel": ActionVisual(
+        icon_name="export-all-excel",
+        tool_tip="Экспорт данных всех фотографий в Excel",
+        status_tip="Пересчитать данные всех фотографий проекта и сохранить их в один файл .xlsx.",
+    ),
     "exit": ActionVisual(
         icon_name="exit-app",
         tool_tip="Выход",
@@ -128,6 +133,16 @@ ACTION_VISUALS: dict[str, ActionVisual] = {
         icon_name="delete-contour",
         tool_tip="Удалить контур",
         status_tip="Удалить контур текущего выбранного изображения.",
+    ),
+    "add_exclusion": ActionVisual(
+        icon_name="negative-selection",
+        tool_tip="Негативное выделение",
+        status_tip="Добавить внутри контура область, пиксели которой не учитываются в расчётах.",
+    ),
+    "delete_exclusion": ActionVisual(
+        icon_name="delete-exclusion",
+        tool_tip="Удалить негативное выделение",
+        status_tip="Удалить негативное выделение, узел которого выбран на канвасе.",
     ),
     "flatten_background": ActionVisual(
         icon_name="flatten-background",

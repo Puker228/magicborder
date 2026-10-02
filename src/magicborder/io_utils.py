@@ -146,6 +146,14 @@ def load_project(path: str | Path) -> ProjectDocument:
         raise FileNotFoundError(f"Файл проекта не найден: {project_path}") from exc
     except json.JSONDecodeError as exc:
         raise ValueError(f"Некорректный JSON проекта: {exc}") from exc
+    # Без этой проверки любой JSON (например, файл аннотации) открывался как
+    # пустой проект, а автосохранение затем перезаписывало его.
+    if isinstance(payload, dict) and "images" not in payload:
+        raise ValueError(
+            "Файл не является проектом MagicBorder: в нём нет списка изображений. "
+            "Возможно, выбран файл аннотации — откройте JSON-файл проекта "
+            "из папки проекта."
+        )
     return ProjectDocument.from_dict(payload)
 
 

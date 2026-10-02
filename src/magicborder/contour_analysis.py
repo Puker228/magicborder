@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+import math
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 import cv2
@@ -130,33 +131,63 @@ class _ConvertedPixels:
         )
 
 
-def contour_signature(points: list[Point]) -> ContourSignature:
+# Разделитель контура и негативных выделений в сигнатуре: координаты точек
+# ограничены изображением, поэтому бесконечность с ними не совпадёт.
+_EXCLUSION_SIGNATURE_SEPARATOR = (math.inf, math.inf)
+
+
+def contour_signature(
+    points: list[Point], exclusions: Sequence[list[Point]] = ()
+) -> ContourSignature:
+    """Ключ кэша расчётов: меняется и при правке контура, и при правке исключений."""
+    signature = _points_signature(points)
+    for polygon in exclusions:
+        signature += (_EXCLUSION_SIGNATURE_SEPARATOR, *_points_signature(polygon))
+    return signature
+
+
+def _points_signature(points: list[Point]) -> ContourSignature:
     return tuple(
         (round(float(point.x), 3), round(float(point.y), 3)) for point in points
     )
 
 
 def contour_rgb_pixels_from_points(
-    rgb_array: np.ndarray, points: list[Point]
+    rgb_array: np.ndarray,
+    points: list[Point],
+    exclusions: Sequence[list[Point]] = (),
 ) -> np.ndarray:
     if len(points) < 3:
         return np.empty((0, 3), dtype=np.uint8)
 
-    mask = contour_mask_from_points(rgb_array.shape[:2], points)
+    mask = contour_mask_from_points(rgb_array.shape[:2], points, exclusions)
     pixels = rgb_array[mask > 0]
     return np.ascontiguousarray(pixels.reshape((-1, 3)))
 
 
-def contour_mask_from_points(shape: tuple[int, ...], points: list[Point]) -> np.ndarray:
+def contour_mask_from_points(
+    shape: tuple[int, ...],
+    points: list[Point],
+    exclusions: Sequence[list[Point]] = (),
+) -> np.ndarray:
+    """Маска пикселей контура; пиксели негативных выделений из неё вычитаются."""
     mask = np.zeros(shape[:2], dtype=np.uint8)
     if len(points) < 3:
         return mask
-    polygon = np.array(
+    cv2.fillPoly(mask, [_polygon_array(points)], 255)
+    exclusion_polygons = [
+        _polygon_array(polygon) for polygon in exclusions if len(polygon) >= 3
+    ]
+    if exclusion_polygons:
+        cv2.fillPoly(mask, exclusion_polygons, 0)
+    return mask
+
+
+def _polygon_array(points: list[Point]) -> np.ndarray:
+    return np.array(
         [[int(round(point.x)), int(round(point.y))] for point in points],
         dtype=np.int32,
     )
-    cv2.fillPoly(mask, [polygon], 255)
-    return mask
 
 
 def flatten_background_outside_contour(
@@ -176,9 +207,11 @@ def flatten_background_outside_contour(
 
 
 def build_contour_analysis(
-    rgb_array: np.ndarray, points: list[Point]
+    rgb_array: np.ndarray,
+    points: list[Point],
+    exclusions: Sequence[list[Point]] = (),
 ) -> ContourAnalysis | None:
-    pixels = contour_rgb_pixels_from_points(rgb_array, points)
+    pixels = contour_rgb_pixels_from_points(rgb_array, points, exclusions)
     if pixels.size == 0:
         return None
 
@@ -190,10 +223,12 @@ def build_contour_analysis(
 
 
 def contour_color_sums(
-    rgb_array: np.ndarray, points: list[Point]
+    rgb_array: np.ndarray,
+    points: list[Point],
+    exclusions: Sequence[list[Point]] = (),
 ) -> ContourColorSums | None:
     """Суммы для статистики проекта: без построения гистограмм."""
-    pixels = contour_rgb_pixels_from_points(rgb_array, points)
+    pixels = contour_rgb_pixels_from_points(rgb_array, points, exclusions)
     if pixels.size == 0:
         return None
     return _ConvertedPixels.from_rgb_pixels(pixels).sums()
