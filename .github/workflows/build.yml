@@ -1,0 +1,139 @@
+name: Build Portable
+
+# Сборки создаются только по изменениям в main:
+# - push в main, но только если изменилось то, что попадает в бинарник
+#   (код, данные, зависимости, сборочные скрипты или сам workflow);
+# - workflow_dispatch для ручной пересборки (job ниже ограничен веткой main).
+# pull_request и теги намеренно не используются.
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "src/**"
+      - "build_tools/**"
+      - "oiv_ampelometric_scales.json"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Новый push в main отменяет устаревшую сборку: нужен артефакт последнего коммита.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    # Защита для workflow_dispatch, запущенного с другой ветки.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Предположение: macos-latest — arm64-раннер, поэтому собирается только
+        # цель macos-arm64. Для macos-x86_64 (doc/portable_build.md) нужен
+        # отдельный Intel-раннер.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            artifact-name: build-linux
+          - os: macos-latest
+            artifact-name: build-macos
+          - os: windows-latest
+            artifact-name: build-windows
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONFAULTHANDLER: "1"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # doc/portable_build.md рекомендует CPython 3.12.x, но по требованию стиля
+      # версия берётся из requires-python (>=3.11,<3.14) в pyproject.toml.
+      - name: Set up Python
+        id: setup-python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: "pyproject.toml"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      # Linux: минимальный набор Qt runtime-библиотек, как в test.yml.
+      # Для macOS и Windows в doc/portable_build.md системные зависимости
+      # не описаны: Qt приходит из wheels PyQt5-Qt5, отдельные шаги не нужны.
+      - name: Install Qt runtime libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3
+
+      # Аналог `uv sync --frozen --extra build` из документации: --locked
+      # дополнительно делает проверку `uv lock --check` и падает, если
+      # uv.lock рассинхронизирован с pyproject.toml.
+      - name: Install the project
+        run: uv sync --locked --extra build
+        env:
+          UV_PYTHON: ${{ steps.setup-python.outputs.python-path }}
+
+      - name: Check imports
+        run: uv run --extra build python -c "import PyQt5, cv2, numpy, PIL"
+
+      - name: Show build plan (dry-run)
+        run: uv run --extra build python build_tools/portable_build.py --dry-run
+
+      # Основной формат для всех платформ: .tar.gz на Linux, .zip на macOS/Windows.
+      # Smoke-test артефакта wrapper выполняет сам; он не отключается.
+      - name: Build portable archive
+        run: uv run --extra build python build_tools/portable_build.py --artifact archive --clean
+
+      # Опциональный формат Windows из документации: single-file .exe.
+      - name: Build onefile exe (Windows)
+        if: runner.os == 'Windows'
+        run: uv run --extra build python build_tools/portable_build.py --artifact onefile --clean
+
+      # Опциональный формат Linux из документации: AppImage.
+      # appimagetool скачивается так, как описано в документации (канал
+      # continuous, без фиксации версии). В CI нет FUSE, поэтому используется
+      # APPIMAGE_EXTRACT_AND_RUN=1, а не установка libfuse2t64.
+      - name: Download appimagetool (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p .tools
+          curl -fL --retry 3 \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
+            -o .tools/appimagetool-x86_64.AppImage
+          chmod +x .tools/appimagetool-x86_64.AppImage
+          APPIMAGE_EXTRACT_AND_RUN=1 .tools/appimagetool-x86_64.AppImage --version
+
+      - name: Build AppImage (Linux)
+        if: runner.os == 'Linux'
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          APPIMAGETOOL="$PWD/.tools/appimagetool-x86_64.AppImage" \
+            uv run --extra build python build_tools/portable_build.py --artifact appimage --clean
+
+      # Готовые файлы лежат в dist/<platform-id>/ (например dist/linux-x86_64/).
+      # Они уже сжаты (.zip/.tar.gz/.exe/.AppImage), поэтому повторное сжатие отключено.
+      - name: Upload artifact
+        # v7 — актуальная мажорная версия; SHA получен через git ls-remote,
+        # но перед коммитом его нужно ещё раз проверить вручную.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact-name }}
+          path: |
+            dist/
+            !dist/.gitkeep
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0

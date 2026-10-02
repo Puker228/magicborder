@@ -44,6 +44,11 @@ from .models import (
 ANGLE_ARC_COLOR = "#7c3aed"
 CONTOUR_LINE_WIDTH = 2.0
 CONTOUR_Z = 10
+# Негативное выделение рисуется теми же линиями, что и контур, но красным
+# с полупрозрачной заливкой, чтобы исключённую область было видно сразу.
+EXCLUSION_LINE_COLOR = "#dc2626"
+EXCLUSION_FILL_COLOR = QColor(220, 38, 38, 45)
+EXCLUSION_Z = 12
 MEASUREMENT_LINE_WIDTH = 2.0
 MEASUREMENT_HIGHLIGHT_LINE_WIDTH = 4.4
 ANGLE_LINE_Z = 22
@@ -139,6 +144,53 @@ class NodeHandleItem(QGraphicsEllipseItem):
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.RightButton:
             self.canvas.remove_node(self.index)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
+class ExclusionHandleItem(QGraphicsEllipseItem):
+    """Узел негативного выделения: редактируется так же, как узел контура."""
+
+    def __init__(
+        self,
+        canvas: ImageCanvas,
+        exclusion_index: int,
+        index: int,
+        position: QPointF,
+    ) -> None:
+        radius = 5.5
+        super().__init__(-radius, -radius, radius * 2.0, radius * 2.0)
+        self.canvas = canvas
+        self.exclusion_index = exclusion_index
+        self.index = index
+        self.setFlag(QGraphicsItem.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
+        self.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+        self.setBrush(QColor(EXCLUSION_LINE_COLOR))
+        self.setPen(QPen(QColor("white"), 1.4))
+        self.setZValue(21)
+        self.setToolTip(
+            "Негативное выделение: перетащите для редактирования. "
+            "Правая кнопка мыши удаляет узел."
+        )
+        self.setPos(position)
+
+    def itemChange(
+        self, change: QGraphicsItem.GraphicsItemChange, value: object
+    ) -> object:
+        if change == QGraphicsItem.ItemPositionChange and isinstance(value, QPointF):
+            return self.canvas.constrain_point(value)
+        if change == QGraphicsItem.ItemPositionHasChanged:
+            self.canvas.exclusion_handle_moved(
+                self.exclusion_index, self.index, self.pos()
+            )
+        return super().itemChange(change, value)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.RightButton:
+            self.canvas.remove_exclusion_node(self.exclusion_index, self.index)
             event.accept()
             return
         super().mousePressEvent(event)
@@ -397,6 +449,10 @@ class ImageCanvas(QGraphicsView):
         self._suppress_contour_selection_highlight = False
         self._contour_visible = True
         self._contour_highlighted = False
+        self._exclusions: list[list[QPointF]] = []
+        self._exclusion_path_items: list[QGraphicsPathItem] = []
+        self._exclusion_handles: list[list[ExclusionHandleItem]] = []
+        self._suppress_exclusion_handle_events = False
         self._calibration_points: list[QPointF] = []
         self._calibration_handles: list[CalibrationHandleItem] = []
         self._calibration_label_text = ""
@@ -450,6 +506,12 @@ class ImageCanvas(QGraphicsView):
         self._contour_line_color = normalized_color
         self._apply_contour_highlight()
         return True
+
+    def has_exclusions(self) -> bool:
+        return bool(self._exclusions)
+
+    def has_selected_exclusion(self) -> bool:
+        return self._selected_exclusion_index() is not None
 
     def has_calibration(self) -> bool:
         return len(self._calibration_points) == 2
@@ -723,6 +785,12 @@ class ImageCanvas(QGraphicsView):
     def contour_points(self) -> list[Point]:
         return [Point(point.x(), point.y()) for point in self._contour_points]
 
+    def exclusion_polygons(self) -> list[list[Point]]:
+        return [
+            [Point(point.x(), point.y()) for point in polygon]
+            for polygon in self._exclusions
+        ]
+
     def calibration_points(self) -> list[Point]:
         return [Point(point.x(), point.y()) for point in self._calibration_points]
 
@@ -815,6 +883,7 @@ class ImageCanvas(QGraphicsView):
             return np.empty((0, 3), dtype=np.uint8)
 
         mask = self._contour_mask()
+        self._subtract_exclusions(mask)
         pixels = self._loaded_image.rgb_array[mask > 0]
         return np.ascontiguousarray(pixels.reshape((-1, 3)))
 
@@ -871,6 +940,9 @@ class ImageCanvas(QGraphicsView):
 
     def clear_contour(self) -> None:
         self._contour_points.clear()
+        # Негативные выделения существуют только внутри контура.
+        self._exclusions.clear()
+        self._clear_exclusion_graphics()
         self._contour_line_color = CONTOUR_LINE_COLOR
         self._contour_visible = True
         self._contour_highlighted = False
@@ -904,6 +976,152 @@ class ImageCanvas(QGraphicsView):
     def set_contour_visible(self, visible: bool) -> None:
         self._contour_visible = bool(visible)
         self._apply_contour_visibility()
+
+    def set_exclusions(self, polygons: Sequence[Sequence[Point]]) -> None:
+        """Заменяет негативные выделения; полигоны меньше чем из 3 точек пропускаются."""
+        if not self._loaded_image:
+            raise ValueError(
+                "Нельзя задать негативное выделение без загруженного изображения."
+            )
+        self._exclusions = [
+            [
+                self.constrain_point(QPointF(float(point.x), float(point.y)))
+                for point in polygon
+            ]
+            for polygon in polygons
+            if len(polygon) >= 3
+        ]
+        self._rebuild_exclusion_graphics()
+        self.contour_geometry_changed.emit()
+
+    def add_exclusion(self, points: Sequence[Point]) -> None:
+        if not self.has_contour():
+            raise ValueError("Сначала постройте или загрузите контур.")
+        if len(points) < 3:
+            raise ValueError("Негативное выделение должно содержать минимум 3 точки.")
+
+        self._exclusions.append(
+            [
+                self.constrain_point(QPointF(float(point.x), float(point.y)))
+                for point in points
+            ]
+        )
+        # Новое выделение должно быть видно сразу, даже если контур был скрыт.
+        self._contour_visible = True
+        self._apply_contour_visibility()
+        self._rebuild_exclusion_graphics()
+        self.contour_geometry_changed.emit()
+        self.message_changed.emit(
+            f"Негативное выделение добавлено: {len(points)} узлов. "
+            "Пиксели внутри него не учитываются в расчётах."
+        )
+
+    def delete_selected_exclusion(self) -> bool:
+        exclusion_index = self._selected_exclusion_index()
+        if exclusion_index is None:
+            return False
+
+        del self._exclusions[exclusion_index]
+        self._rebuild_exclusion_graphics()
+        self.contour_geometry_changed.emit()
+        self.message_changed.emit("Негативное выделение удалено.")
+        return True
+
+    def exclusion_handle_moved(
+        self, exclusion_index: int, index: int, position: QPointF
+    ) -> None:
+        if (
+            self._suppress_exclusion_handle_events
+            or exclusion_index >= len(self._exclusions)
+            or index >= len(self._exclusions[exclusion_index])
+        ):
+            return
+        self._exclusions[exclusion_index][index] = self.constrain_point(position)
+        self._refresh_exclusion_path(exclusion_index)
+        self.contour_geometry_changed.emit()
+
+    def remove_exclusion_node(self, exclusion_index: int, index: int) -> bool:
+        if not (0 <= exclusion_index < len(self._exclusions)):
+            return False
+        polygon = self._exclusions[exclusion_index]
+        if len(polygon) <= 3:
+            self.message_changed.emit(
+                "Негативное выделение должно содержать минимум 3 узла."
+            )
+            return False
+        if not (0 <= index < len(polygon)):
+            return False
+
+        del polygon[index]
+        self._rebuild_exclusion_graphics()
+        self.contour_geometry_changed.emit()
+        self.message_changed.emit("Узел негативного выделения удалён.")
+        return True
+
+    def delete_selected_exclusion_nodes(self) -> bool:
+        removed = 0
+        blocked = False
+        for exclusion_index, handles in enumerate(self._exclusion_handles):
+            selected_indexes = sorted(
+                {handle.index for handle in handles if handle.isSelected()},
+                reverse=True,
+            )
+            if not selected_indexes:
+                continue
+            polygon = self._exclusions[exclusion_index]
+            removable_count = max(0, len(polygon) - 3)
+            if removable_count < len(selected_indexes):
+                blocked = True
+            for index in selected_indexes[:removable_count]:
+                del polygon[index]
+                removed += 1
+
+        if removed == 0:
+            if blocked:
+                self.message_changed.emit(
+                    "Нельзя удалить больше узлов: негативное выделение "
+                    "должно остаться замкнутым."
+                )
+            return False
+
+        self._rebuild_exclusion_graphics()
+        self.contour_geometry_changed.emit()
+        self.message_changed.emit(f"Удалено узлов негативного выделения: {removed}.")
+        return True
+
+    def insert_exclusion_node_near(self, scene_pos: QPointF) -> bool:
+        """Добавляет узел в ближайший сегмент негативного выделения.
+
+        Возвращает False без сообщения, если рядом нет сегмента исключения:
+        тогда двойной щелчок обрабатывается как добавление узла контура.
+        """
+        best_distance = float("inf")
+        best_projection = None
+        best_target: tuple[int, int] | None = None
+        for exclusion_index, polygon in enumerate(self._exclusions):
+            for index, start in enumerate(polygon):
+                end = polygon[(index + 1) % len(polygon)]
+                distance, projection = _distance_to_segment(scene_pos, start, end)
+                if distance < best_distance:
+                    best_distance = distance
+                    best_projection = projection
+                    best_target = (exclusion_index, index + 1)
+
+        if (
+            best_projection is None
+            or best_target is None
+            or best_distance > self._segment_pick_tolerance()
+        ):
+            return False
+
+        exclusion_index, insert_index = best_target
+        self._exclusions[exclusion_index].insert(
+            insert_index, self.constrain_point(best_projection)
+        )
+        self._rebuild_exclusion_graphics()
+        self.contour_geometry_changed.emit()
+        self.message_changed.emit("Новый узел негативного выделения добавлен.")
+        return True
 
     def begin_calibration(self) -> None:
         if not self.has_image():
@@ -1654,10 +1872,12 @@ class ImageCanvas(QGraphicsView):
             return
         if event.button() == Qt.LeftButton and self.is_contour_visible():
             item = self.itemAt(event.pos())
-            if not isinstance(item, NodeHandleItem):
+            if not isinstance(item, (NodeHandleItem, ExclusionHandleItem)):
                 scene_pos = self.mapToScene(event.pos())
                 if self._image_item.boundingRect().contains(scene_pos):
-                    if self.insert_node_near(scene_pos):
+                    if self.insert_exclusion_node_near(
+                        scene_pos
+                    ) or self.insert_node_near(scene_pos):
                         event.accept()
                         return
         super().mouseDoubleClickEvent(event)
@@ -1686,6 +1906,12 @@ class ImageCanvas(QGraphicsView):
             event.key() in (Qt.Key_Delete, Qt.Key_Backspace)
             and self.has_selected_segment_endpoint()
             and self.delete_selected_segment()
+        ):
+            event.accept()
+            return
+        if (
+            event.key() in (Qt.Key_Delete, Qt.Key_Backspace)
+            and self.delete_selected_exclusion_nodes()
         ):
             event.accept()
             return
@@ -2518,6 +2744,68 @@ class ImageCanvas(QGraphicsView):
                     handle.setSelected(False)
                 finally:
                     self._suppress_contour_selection_highlight = False
+        self._apply_exclusion_visibility()
+
+    def _apply_exclusion_visibility(self) -> None:
+        # Негативные выделения показываются и скрываются вместе с контуром.
+        visible = self.has_contour() and self._contour_visible
+        for path_item in self._exclusion_path_items:
+            path_item.setVisible(visible)
+        for handles in self._exclusion_handles:
+            for handle in handles:
+                handle.setVisible(visible)
+                if not visible:
+                    handle.setSelected(False)
+
+    def _clear_exclusion_graphics(self) -> None:
+        for path_item in self._exclusion_path_items:
+            self._scene.removeItem(path_item)
+        for handles in self._exclusion_handles:
+            for handle in handles:
+                self._scene.removeItem(handle)
+        self._exclusion_path_items.clear()
+        self._exclusion_handles.clear()
+
+    def _rebuild_exclusion_graphics(self) -> None:
+        self._clear_exclusion_graphics()
+        pen = QPen(QColor(EXCLUSION_LINE_COLOR), CONTOUR_LINE_WIDTH)
+        pen.setCosmetic(True)
+        self._suppress_exclusion_handle_events = True
+        try:
+            for exclusion_index, polygon in enumerate(self._exclusions):
+                path_item = QGraphicsPathItem()
+                path_item.setPen(pen)
+                path_item.setBrush(QBrush(EXCLUSION_FILL_COLOR))
+                path_item.setZValue(EXCLUSION_Z)
+                self._scene.addItem(path_item)
+                self._exclusion_path_items.append(path_item)
+                self._refresh_exclusion_path(exclusion_index)
+
+                handles: list[ExclusionHandleItem] = []
+                for index, point in enumerate(polygon):
+                    handle = ExclusionHandleItem(self, exclusion_index, index, point)
+                    self._scene.addItem(handle)
+                    handles.append(handle)
+                self._exclusion_handles.append(handles)
+        finally:
+            self._suppress_exclusion_handle_events = False
+        self._apply_exclusion_visibility()
+
+    def _refresh_exclusion_path(self, exclusion_index: int) -> None:
+        polygon = self._exclusions[exclusion_index]
+        path = QPainterPath()
+        if polygon:
+            path.moveTo(polygon[0])
+            for point in polygon[1:]:
+                path.lineTo(point)
+            path.closeSubpath()
+        self._exclusion_path_items[exclusion_index].setPath(path)
+
+    def _selected_exclusion_index(self) -> int | None:
+        for exclusion_index, handles in enumerate(self._exclusion_handles):
+            if any(handle.isVisible() and handle.isSelected() for handle in handles):
+                return exclusion_index
+        return None
 
     def _clear_calibration_handles(self) -> None:
         for handle in self._calibration_handles:
@@ -2552,6 +2840,18 @@ class ImageCanvas(QGraphicsView):
         )
         cv2.fillPoly(mask, [polygon], 255)
         return mask
+
+    def _subtract_exclusions(self, mask: np.ndarray) -> None:
+        polygons = [
+            np.array(
+                [[int(round(point.x())), int(round(point.y()))] for point in polygon],
+                dtype=np.int32,
+            )
+            for polygon in self._exclusions
+            if len(polygon) >= 3
+        ]
+        if polygons:
+            cv2.fillPoly(mask, polygons, 0)
 
 
 def _distance_to_segment(

@@ -144,11 +144,20 @@ def apply_crop_to_record(
         if _polygon_area(points) <= _DEGENERATE_LENGTH:
             record.annotation = None
         else:
+            exclusions = [
+                moved
+                for moved in (
+                    [move(point) for point in polygon]
+                    for polygon in annotation.exclusions
+                )
+                if _polygon_area(moved) > _DEGENERATE_LENGTH
+            ]
             record.annotation = replace(
                 annotation,
                 image_width=output_width,
                 image_height=output_height,
                 points=points,
+                exclusions=exclusions,
             )
 
     calibration = record.calibration
